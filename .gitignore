@@ -1,0 +1,12 @@
+# 个人配置与凭据 —— 绝不要提交（token / 账号 / 密码都在里面）
+config.yaml
+menu.local.json
+
+# 运行产物
+logs/
+data/
+
+# 依赖与临时文件
+node_modules/
+*.tmp
+*.bak

@@ -1,0 +1,22 @@
+﻿{
+  "name": "court-grabber",
+  "version": "1.0.0",
+  "description": "校园羽毛球场自动预约工具（Node.js，零第三方依赖）——候场、开闸冲刺、自动支付、结果标记",
+  "private": false,
+  "license": "MIT",
+  "main": "src/grab.js",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "selftest": "node src/selftest.js --offline",
+    "selftest:online": "node src/selftest.js",
+    "menu": "node tools/build-menu.js",
+    "dry": "node src/grab.js --dry-run",
+    "grab": "node src/grab.js",
+    "login": "node src/login.js",
+    "probe": "node src/probe.js"
+  },
+  "keywords": ["nodejs", "campus", "badminton", "booking", "automation"],
+  "dependencies": {}
+}
