@@ -1,4 +1,4 @@
-﻿'use strict';
+'use strict';
 /**
  * 抢场主流程
  *
@@ -31,9 +31,6 @@
 
 const path = require('path');
 const fs = require('fs');
-// 跨平台临时目录：Windows 上是 %TEMP%，macOS/Linux 上是 $TMPDIR 或 /tmp。
-// （软路由版里这里写的是 '/tmp'，开源版改成可移植写法。）
-const TMP_DIR = process.env.TMPDIR || process.env.TEMP || '/tmp';
 const { loadConfig, parseSlot, applyWindowOverrides, applyPriorityOverrides } = require('./config');
 const { ApiClient, ApiError } = require('./client');
 const { ServerClock, sleep, fmtFull, fmtServer, fmtServerDate, parseServerTs, serverDateTime, toMinutes } = require('./util');
@@ -115,11 +112,10 @@ function subtractIntervals(aStart, aEnd, blocks) {
 }
 
 /**
- * ★ 内置课表：**开源版默认为空**，请你填自己的课表。
+ * ★ 内置课表（2026-2027 第一学期，第 6 周，来自校园系统截图 G:\图片\课表.jpg，
+ *   经 J:\DS\Personal Info\01-education\education.md 第 6 节核对）。
  *
- * ⚠️ 要填课表请改 config.yaml 的 target.schedule.classes。
- *    教务系统的课表通常**只有节次、没有钟点**，所以还得自己核对一份「节次 → 钟点」表。
- *    下面这份口径很多学校通用，仅供参考：
+ * ⚠️ 截图里只有「第几节」，没有钟点，所以下面的钟点用的是北语常见口径：
  *      一、二节 08:00-09:40   三、四节 10:10-11:50   五、六节 14:00-15:40
  *      九、十节 18:30-20:05   十一、十二节 20:15-21:50
  *    其中「九、十节」的**结束时刻**直接决定傍晚能不能打球，是整个避让逻辑里最敏感
@@ -143,9 +139,10 @@ function scheduleEnabled(cfg) {
 }
 
 const DEFAULT_SCHEDULE = {
-  // ↓ 开源版默认为空：没有课表信息时，任何时段都允许预约。
-  //   要用课表避让，请在 config.yaml 的 target.schedule.classes 里填自己的课表。
-  // ★ 周四只有上午一节（一、二节 08:00-09:40）
+  mon: [['08:00', '09:40'], ['10:10', '11:50']],
+  tue: [['10:10', '11:50']],
+  wed: [['08:00', '09:40'], ['10:10', '11:50'], ['14:00', '15:40'], ['18:30', '21:05']],
+  // ★ 周四只有「日语专题阅读与写作」（一、二节 08:00-09:40）与「日语口译（一）」
   //   （五、六节 14:00-15:40）—— **晚上没有课**。
   //   踩过的坑（2026-10-12）：这里原本还写了 ['18:30','20:05']，那其实是**周三**第九节
   //   「生活中的法律常识」（教二301）的钟点，被串到周四来了。后果是：周四 18:00-20:00
@@ -155,8 +152,10 @@ const DEFAULT_SCHEDULE = {
   fri: [],
 };
 
-/** 默认不做「课表二次覆盖」。要用就填 config.yaml 的 target.schedule.free。 */
-const DEFAULT_FREE_OVERRIDE = {};
+/** 默认把「星期三的晚课」标成不上（用户 m02402：星期三的晚课我基本不去）*/
+const DEFAULT_FREE_OVERRIDE = {
+  wed: [['18:30', '21:05']],
+};
 
 // ───────────────────────── CLI ─────────────────────────
 
@@ -203,7 +202,7 @@ const cli = parseArgs(argv);
 
 if (cli.flags.has('help')) {
   console.log(`
-本校 羽毛球抢场脚本
+BLCU 羽毛球抢场脚本
 
 用法：
   node src/grab.js [选项]
@@ -444,7 +443,7 @@ class Grabber {
       } else {
         if (g2.authHint) {
           throw new ApiError(
-            `鉴权失败/会话失效（服务端返回「${g2.message}」）——请按「从浏览器开发者工具里抓一次 token」的办法 重新抓 token 后执行 ` +
+            `鉴权失败/会话失效（服务端返回「${g2.message}」）——请按 recon/TOKEN.md 重新抓 token 后执行 ` +
             `node src/probe.js set-token <token>`,
             0, null, 'auth'
           );
@@ -625,7 +624,7 @@ class Grabber {
   /**
    * ★ 课表：算出目标日期那天，哪些时间**不能**打球（有课）。
    *
-   * 为什么要有它：最初的需求就是「订场时间不要和上课时间撞车（个别不想去的课除外）。
+   * 为什么要有它：用户 2026-10-11 明确要求「最好不要和我课表的时间冲突，除了星期三
    * 的晚课（我基本不去）」。课表是**按星期几**固定的，而 targetDate 是每天滚动的
    * （T+2），所以这里按 targetDate 的星期几现算，不写死日期。
    *
@@ -1149,6 +1148,28 @@ class Grabber {
    * 同时把网格刷新回服务端最新状态（顺便校准时钟）。
    * 返回最后取到的网格。
    */
+  /**
+   * 候场复查间隔：离放场时刻越近，复查越密。
+   * ★ 2026-10-25 实测：候场固定 15 秒一次 → 08:00:00 开闸，程序直到 08:00:17.7
+   *   才第一次看到「窗口已开」，白白晚 17 秒才冲刺。冲刺再快也补不回这 17 秒，
+   *   所以收尾窗口（默认最后 60 秒）内改成每 500ms 复查一次。
+   * baseMs：常态间隔；已过放场时刻但窗口还没滚（服务端放场延迟）时保持同一快节奏。
+   */
+  _idleSleepMs(baseMs) {
+    const sched = this.cfg.schedule || {};
+    const winMs = Math.max(Number(sched.finalPollWindowMs || 60000), 5000);
+    const finMs = Math.max(Number(sched.finalPollMs || 500), 100);
+    if (!this.releaseAt) return baseMs;
+    const left = this.releaseAt - this.clock.now();
+    // 只在「放场前一刻 ~ 放场后宽限期」这段用快节奏：
+    //   - left 在收尾窗口内（含刚过点，服务端放场可能晚十几秒）；
+    //   - 过了宽限期还开着闸却没放出来，说明不是「正在放场」，退回常态节奏，
+    //     免得一份过期的 releaseAt 让程序以 500ms 一轮空打服务器。
+    const graceMs = Math.max(Number(sched.guardGraceMs || 180000), 30000);
+    if (left <= winMs && left > -graceMs) return Math.min(baseMs, finMs);
+    return baseMs;
+  }
+
   async _idleWaitForRelease() {
     const sched = this.cfg.schedule || {};
     const idleMs = Math.max(Number(sched.idlePollMs || 15000), 5000);
@@ -1175,7 +1196,12 @@ class Grabber {
       this._guardDeadline = (base == null ? now + 6 * 3600000 : base) + graceMs;
       this.log.info(`  兜底期限：${fmtServer(this._guardDeadline)}（到点仍未等到目标日期就放弃，绝不抢错日期）`);
     }
-    this.log.info(`  目标日期尚未放场 → 放场前每 ${(idleMs / 1000).toFixed(0)} 秒复查一次（不打扰服务器）`);
+    const winSec = Math.round(Math.max(Number(sched.finalPollWindowMs || 60000), 5000) / 1000);
+    const finLogMs = Math.max(Number(sched.finalPollMs || 500), 100);
+    this.log.info(
+      `  目标日期尚未放场 → 放场前每 ${(idleMs / 1000).toFixed(0)} 秒复查一次` +
+      `（最后 ${winSec} 秒收紧到每 ${finLogMs}ms 一次；平时不打扰服务器）`
+    );
     let last = this._targetGrid || this.grid;
     let loggedClosed = false;
     for (;;) {
@@ -1193,11 +1219,12 @@ class Grabber {
         // 闸门关着时窗口大概还没滚，网格几乎每刻都在变 —— 用快节奏复查，
         // 否则「真正开闸」那一刻可能正好落在 15 秒的盲区里。
         await this._recheckTargetGrid(last).then((g) => { if (g) last = g; });
-        await sleep(2000);
+        // ★ 收尾窗口内别按 2 秒走 —— 开闸那一刻要尽早上来
+        await sleep(this._idleSleepMs(2000));
         continue;
       }
 
-      await this._sleepKeepingTokenFresh(idleMs);
+      await this._sleepKeepingTokenFresh(this._idleSleepMs(idleMs));
       try {
         const g = await this.fetchGridRetry(this.targetDate, 1);
         if (g.ok) {
@@ -1385,6 +1412,18 @@ class Grabber {
             '当前没有匹配到任何候选方案 → 立即收手（换个时段再试一次即可）'
           );
           return false;
+        }
+        // ★ 保险：网格显示还有空位、却一个方案都匹配不出来 —— 多半是放场瞬间
+        //   网格/时段表还没刷齐（2026-10-25 首轮直接匹配出 25 个候选，是正常情况；
+        //   但万一遇到 0 个，别拿这份不完整的网格继续 120ms 一轮地空打）。
+        //   隔 100ms 重拉一次网格再匹配；只在前 3 轮做，后面就是真的没位了。
+        const openSlotCnt = (g.grid.slots || []).filter((sl) => sl.bookableCount > 0).length;
+        if (openSlotCnt > 0 && round <= 3 && !this.opts.now) {
+          this.log.warn(
+            `第 ${round} 轮：网格显示还有 ${openSlotCnt} 个时段有空场地，却没匹配出方案 → 100ms 后重拉网格`
+          );
+          await sleep(100);
+          continue;
         }
         await sleep(pollMs);
         continue;
@@ -1848,7 +1887,7 @@ async function main() {
     } else {
       log.error('配置缺少 auth.token。两条路：');
       log.error('  ① 推荐：在 config.yaml 里设 auth.allowRenew: true 并填好 auth.usercode，脚本会自己换发 token');
-      log.error('  ② 手动：node src/login.js --renew，或按「从浏览器开发者工具里抓一次 token」的办法 抓一次 token 填进 config.yaml');
+      log.error('  ② 手动：node src/login.js --renew，或按 recon/TOKEN.md 抓一次 token 填进 config.yaml');
       process.exitCode = 2;
       log.close();
       return;
@@ -1892,7 +1931,7 @@ async function main() {
       // ★★ 「这一趟是不是预演」必须看**运行模式**，不能只看订单的 dryRun 标记。
       //   踩过的坑：原来写 `orders.length > 0 && realOrders.length === 0`，
       //   而「满场没抢到」那种预演 orders 是**空数组** ⇒ 算出来 false ⇒ 标记照写，
-      //   实测把线上那条 130xxx SUCCESS 覆盖成了 FAILED（我当场用 rebuild-marker.js 才救回来）。
+      //   实测把线上那条 130191 SUCCESS 覆盖成了 FAILED（我当场用 rebuild-marker.js 才救回来）。
       const anyDry = !!(g.opts && g.opts.dryRun) || (orders.length > 0 && realOrders.length === 0);
       const ok = realOrders.length > 0;
       const marker = {
@@ -1946,10 +1985,7 @@ async function main() {
       fs.mkdirSync(stateDir, { recursive: true });
       fs.writeFileSync(path.join(stateDir, 'last-result.json'), JSON.stringify(marker, null, 2), 'utf8');
       // 同时放到 /tmp 一份：LuCI/SSH 下看最快，且不占 overlay
-      // 再往系统临时目录写一份（软路由上的脚本会去读它，当跨进程的「最新结果」看板）。
-  try {
-    fs.writeFileSync(path.join(require('os').tmpdir(), 'blcu-last-result.json'), JSON.stringify(marker, null, 2), 'utf8');
-  } catch (e) { /* 写不了就算了，不影响主流程 */ }
+      try { fs.writeFileSync('/tmp/blcu-last-result.json', JSON.stringify(marker, null, 2), 'utf8'); } catch (e) { /* ignore */ }
       log.info(`结果标记：${marker.status}${marker.orderNo ? '  订单号=' + marker.orderNo : ''}`);
     } catch (e) {
       log.warn(`写结果标记失败（不影响抢场）：${e.message}`);
@@ -1961,7 +1997,7 @@ async function main() {
     writeMarker(result, null);
     if (result && result.error) {
       process.exitCode = 1;
-      try { await notify(config.pay.notify, `【本校 抢场】本轮失败：${result.error}`, log); } catch (e2) { /* ignore */ }
+      try { await notify(config.pay.notify, `【BLCU 抢场】本轮失败：${result.error}`, log); } catch (e2) { /* ignore */ }
     } else if (result && !result.locked && !cli.flags.has('poll')) {
       process.exitCode = 1;
     }
@@ -1970,7 +2006,7 @@ async function main() {
     writeMarker(null, e.message);
     if (cli.flags.has('verbose') && e.stack) log.debug(e.stack);
     process.exitCode = 1;
-    try { await notify(config.pay.notify, `【本校 抢场】执行中止：${e.message}`, log); } catch (e2) { /* ignore */ }
+    try { await notify(config.pay.notify, `【BLCU 抢场】执行中止：${e.message}`, log); } catch (e2) { /* ignore */ }
   } finally {
     log.close();
   }
@@ -1987,7 +2023,7 @@ module.exports = {
   Grabber,
   main,
   parseArgs,
-  // ★ 导出课表常量：`本项目内部的课表生成工具` 用它生成 config.yaml 的
+  // ★ 导出课表常量：`recon/gen-schedule-cfg.js` 用它生成 config.yaml 的
   //   target.schedule 块。手动誊写一份必然会和这里漂移，所以只留一处定义。
   DEFAULT_SCHEDULE,
   DEFAULT_FREE_OVERRIDE,

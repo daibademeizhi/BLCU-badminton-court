@@ -1,4 +1,4 @@
-﻿'use strict';
+'use strict';
 /**
  * 配置加载与校验。
  *
@@ -159,10 +159,10 @@ function loadYamlFile(file) {
 // ───────────────────────── 配置模型 ─────────────────────────
 
 const DEFAULTS = {
-  baseUrl: 'https://example.invalid',
+  baseUrl: 'https://tygyypt.blcu.edu.cn',
   prefix: '/service/appointment/appointment',
   venue: {
-    nodeid: '<场馆nodeid>',
+    nodeid: '1241984413986988032',
     name: '羽毛球',
   },
   auth: {
@@ -196,7 +196,7 @@ const DEFAULTS = {
     // 0 = 一点都不能重叠；30 = 允许蹭到课前半小时（默认）。
     conflictGraceMin: 30,
     // 课表：按星期几写「有课」的时间区间，抢场时会自动避开。
-    // 留空 {} → 用 grab.js 里的内置课表（开源版默认是空的 = 不避让）。
+    // 留空 {} → 用 grab.js 里的内置课表（DEFAULT_SCHEDULE，钟点待用户核对）。
     // classes = 有课；free = 把某些课标成「其实不上」（可在已有区间上打洞）。
     schedule: { classes: {}, free: {} },
   },
@@ -208,6 +208,12 @@ const DEFAULTS = {
     // 放场前「慢速候场」复查间隔（毫秒）。放场前只按这个节奏拉网格，
     // 避免为了盯 08:00 而在 07:5x 就把服务器打满。默认 15 秒。
     idlePollMs: 15000,
+    // ★ 收尾窗口：离放场时刻不足 finalPollWindowMs 时，把复查节奏从 idlePollMs
+    //   收紧到 finalPollMs。起因是 2026-10-25 实测：候场固定 15 秒一次，
+    //   08:00:00 开闸后直到 08:00:17.7 才第一次看到「窗口已开」，白晚 17 秒冲刺。
+    //   当天抢的是冷门时段没出事；换成秒没的 16:00-18:00 就等于必输。
+    finalPollWindowMs: 60000,
+    finalPollMs: 500,
     // 放场时刻之后的宽限期（毫秒）：服务端放场可能晚十几秒到几分钟。
     // 宽限期内持续复查目标日期；超过这个期限还没放出来就放弃本轮（绝不抢其它日期）。
     guardGraceMs: 180000,
@@ -237,7 +243,7 @@ const DEFAULTS = {
     // auto    = 自动挑一条「服务端能跑完」的通道直接扣款：
     //            优先 78（账户卡余额 → /mobile/pay/accountPayOrder，需要 accno + 密码）
     //            其次 77（一卡通支付 → /mobile/pay/openPlatFormPayOrder，无需 accno/密码）
-    //            2026-10-10 实测 本校 该账号只有 50（统一支付平台，必跳浏览器）与 77，故实际走 77
+    //            2026-10-10 实测 BLCU 本账号只有 50（统一支付平台，必跳浏览器）与 77，故实际走 77
     //            任何一步失败都自动降级为「锁场 + 推提醒」，不会反复重试
     // semi    = 只下单锁场，推送付款提醒，你在微信里付（默认、最稳）
     // skip    = 只下单不支付也不提醒

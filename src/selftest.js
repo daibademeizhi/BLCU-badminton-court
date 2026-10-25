@@ -1,4 +1,4 @@
-﻿'use strict';
+'use strict';
 /**
  * 自检：不接触你的账号，全部在本地跑（最后一个联网项只调用无需 token 的公共接口）。
  *
@@ -53,11 +53,11 @@ t('加密参数：AES-128-CBC / key=iv=0102030405060708 / 大写 HEX', () => {
   assert.strictEqual(hex, '66ADD6FE1DFEC38B60861EAA9430296F', `空对象密文不符：${hex}`);
 });
 
-t('已知向量：{"nodeid":"<场馆nodeid>"}', () => {
-  const hex = encrypt('{"nodeid":"<场馆nodeid>"}');
+t('已知向量：{"nodeid":"1241984413986988032"}', () => {
+  const hex = encrypt('{"nodeid":"1241984413986988032"}');
   assert.strictEqual(
     hex,
-    '314FED83BF7ABEC971E5842A8A6316894C0029F65B6E8E312826B835B027FD62',
+    '90D43AE200805E9DA4234C2235B6FB3446EA78517212F529FBC114F5F6DAD24746FCB1661B9FAC7E97EB38C9AAE08FFE',
     `密文不符：${hex}`
   );
 });
@@ -70,7 +70,7 @@ t('往返一致（含中文与数组）', () => {
 });
 
 t('wrap() 产出 {"item":"<HEX>"} 且为 16 字节整数倍', () => {
-  const w = wrap({ nodeid: '<场馆nodeid>' });
+  const w = wrap({ nodeid: '1241984413986988032' });
   assert.deepStrictEqual(Object.keys(w), ['item']);
   assert.ok(/^[0-9A-F]+$/.test(w.item), 'item 应为大写 HEX');
   assert.strictEqual(w.item.length % 32, 0, 'AES 分组应为 16 字节（32 hex 字符）的整数倍');
@@ -117,7 +117,7 @@ t('极简 YAML：嵌套映射 / 数组 / 行内数组 / 注释 / 引号', () => 
   const y = parseYaml(`
 # 顶层注释
 venue:
-  nodeid: "<场馆nodeid>"   # 行尾注释
+  nodeid: "1241984413986988032"   # 行尾注释
   name: 羽毛球
 target:
   hourPriority:
@@ -128,7 +128,7 @@ target:
 net:
   timeoutMs: 20000
 `);
-  assert.strictEqual(y.venue.nodeid, '<场馆nodeid>');
+  assert.strictEqual(y.venue.nodeid, '1241984413986988032');
   assert.strictEqual(y.venue.name, '羽毛球');
   assert.deepStrictEqual(y.target.hourPriority[0], ['18:00', '20:00']);
   assert.strictEqual(y.target.hourPriority.length, 2);
@@ -196,7 +196,7 @@ ta('loadConfig 能加载 config.example.yaml 并给出完整默认值', async ()
   const example = path.resolve(__dirname, '..', 'config.example.yaml');
   const { config } = loadConfig(example);
   assert.ok(config.baseUrl.startsWith('https://'));
-  assert.strictEqual(config.venue.nodeid, '<场馆nodeid>');
+  assert.strictEqual(config.venue.nodeid, '1241984413986988032');
   assert.ok(config.target.hourPriority.length >= 1);
   assert.strictEqual(typeof config.target.hourPriority[0].from, 'number');
   assert.strictEqual(config.pay.mode, 'semi');
@@ -331,8 +331,8 @@ async function requestTests() {
 section('5. 请求封装');
 
 t('ApiClient 解析 baseUrl 并拼出正确路径', () => {
-  const c = new ApiClient({ baseUrl: 'https://example.invalid', prefix: '/service/appointment/appointment' });
-  assert.strictEqual(c._host, 'example.invalid');
+  const c = new ApiClient({ baseUrl: 'https://tygyypt.blcu.edu.cn', prefix: '/service/appointment/appointment' });
+  assert.strictEqual(c._host, 'tygyypt.blcu.edu.cn');
   assert.strictEqual(c._port, 443);
   assert.strictEqual(c.prefix + '/phone/getBookingTimeRange', '/service/appointment/appointment/phone/getBookingTimeRange');
 });
@@ -521,7 +521,7 @@ await ta('AutoPay.settle：服务端没有 78 通道时不硬来，直接转人�
   assert.strictEqual(payCalled, false);
 });
 
-// 2026-10-10 实测：该账号 getPaywayList 只给 50（统一支付平台→必跳浏览器）与 77（一卡通）。
+// 2026-10-10 实测：本账号 getPaywayList 只给 50（统一支付平台→必跳浏览器）与 77（一卡通）。
 // 77 是唯一能纯服务端跑完的通道，且学校 checkYktPwd=true（语义为「不校验密码」）→ 不需要密码。
 await ta('AutoPay.settle：只有 77（一卡通）时自动选它，无密码直接支付成功', async () => {
   const notices = [];
@@ -571,7 +571,7 @@ async function loginTests() {
   const payload = {
     exp: 1791623670,
     sub: 'datalook',
-    Operator: JSON.stringify({ idserial: '<你的学号>', username: '<你的名字>', roleid: '1201', code: '1201' }),
+    Operator: JSON.stringify({ idserial: '202400000000', username: '某同学', roleid: '1201', code: '1201' }),
   };
   const b64 = (o) => Buffer.from(JSON.stringify(o)).toString('base64url');
   const fakeJwt = `${b64({ alg: 'RS256' })}.${b64(payload)}.SIGNATURE`;
@@ -581,13 +581,13 @@ async function loginTests() {
     assert.ok(p, '应能解析');
     assert.strictEqual(p.exp, 1791623670);
     assert.ok(p.operator && typeof p.operator === 'object', 'Operator 应被反序列化');
-    assert.strictEqual(p.operator.idserial, '<你的学号>');
+    assert.strictEqual(p.operator.idserial, '202400000000');
   });
 
   t('identityOf：学号取自 Operator.idserial，不是 payload.code（那是角色码 1201）', () => {
     const id = identityOf(fakeJwt);
-    assert.strictEqual(id.idserial, '<你的学号>');
-    assert.strictEqual(id.username, '<你的名字>');
+    assert.strictEqual(id.idserial, '202400000000');
+    assert.strictEqual(id.username, '某同学');
     assert.strictEqual(id.rolecode, '1201');
     // 反例保护：payload.code 在这个系统里是角色码，不能被当学号
     assert.notStrictEqual(id.idserial, '1201');
@@ -616,7 +616,7 @@ async function loginTests() {
 
   await ta('mintToken：学号首尾有空格时主动拦截（服务端会返回「获取人员信息失败」）', async () => {
     // 服务端对空格敏感，本地先挡掉能省一次失败请求
-    await assert.rejects(() => mintToken(' <你的学号>'), /空格/);
+    await assert.rejects(() => mintToken(' 202400000000'), /空格/);
   });
 
   await ta('★ 安全闸门：allowRenew !== true 时 ensureToken 绝不换发 token', async () => {
@@ -625,7 +625,7 @@ async function loginTests() {
       baseUrl: 'https://127.0.0.1:1', // 故意指向不可达地址：一旦它真的发请求，就会超时/报错
       prefix: '/service/appointment/appointment',
       net: { timeoutMs: 300 },
-      auth: { token: '', usercode: '<你的学号>', allowRenew: false },
+      auth: { token: '', usercode: '202400000000', allowRenew: false },
     };
     let errored = false;
     try {
@@ -682,6 +682,96 @@ function gateGrabber({ now, releaseAt, targetDate, windowFrom, windowTo, serverT
     },
   };
   return g;
+}
+
+/**
+ * 2026-10-25 实测回归：候场固定 15 秒复查 → 08:00:00 开闸后直到 08:00:17.7 才看见
+ * 窗口已开，白白晚 17 秒冲刺（当天抢的 12:00-14:00 冷门没事，秒没的时段等于必输）。
+ * 修复：收尾窗口（默认最后 60 秒）内把复查间隔收紧到 finalPollMs（默认 500ms），
+ *       放场后宽限期内保持快节奏；超出宽限期退回常态，避免过期 releaseAt 空打。
+ */
+/**
+ * 冲刺保险的回归：网格说还有空位、却匹配出 0 个候选 —— 多半是放场瞬间网格没刷齐。
+ * 原来的行为是直接按 burstPollMs 再打一轮（拿不完整的网格空打）；
+ * 现在改为隔 100ms 重拉一次网格。只在前 3 轮生效，后面就是真的没位。
+ */
+async function burstInsuranceTests() {
+  section('8d. 冲刺保险（网格有空位却 0 候选 → 100ms 后重拉网格）');
+  const { Grabber } = require('./grab');
+
+  function mk(slots) {
+    const warns = [];
+    const log = { file: null, info() {}, warn: (m) => warns.push(m), error() {}, debug() {}, section() {} };
+    const cfg = { target: {}, net: {}, safety: {}, pay: {}, paths: {}, schedule: { burstPollMs: 120 } };
+    const g = new Grabber(cfg, log, { maxRounds: 2 });
+    g.targetDate = '2026-10-27';
+    g._targetReady = true;
+    g._gateOpen = () => true;
+    g._gateReason = () => 'stub';
+    g._windowGuard = () => true;
+    g._logGrid = () => {};
+    g.buildTargets = () => [];
+    g._guardDeadline = Date.now() + 10000;
+    let fetches = 0;
+    g.fetchGridRetry = async () => {
+      fetches++;
+      return { ok: true, grid: { courts: [{ id: 'c1', name: '羽毛球场地1' }], grid: {}, slots } };
+    };
+    return { g, warns, fetches: () => fetches };
+  }
+
+  await ta('★ 有空位但 0 候选 → 打出「重拉网格」并继续，不直接按 burstPollMs 空打', async () => {
+    const { g, warns, fetches } = mk([{ value: '16:00-17:00', bookableCount: 2 }]);
+    const r = await g.burst();
+    assert.strictEqual(r, false);
+    assert.strictEqual(fetches(), 2, '两轮各拉一次网格');
+    assert.ok(warns.some((m) => m.includes('100ms 后重拉网格')), '必须提示重拉网格');
+  });
+
+  await ta('网格本来就没空位（没放出来/已满）→ 不走保险提示', async () => {
+    const { g, warns, fetches } = mk([]);
+    await g.burst();
+    assert.strictEqual(fetches(), 2);
+    assert.ok(!warns.some((m) => m.includes('100ms 后重拉网格')), '空网格不该触发保险');
+  });
+}
+
+function pollTests() {
+  section('8c. 候场复查节奏（2026-10-25 晚 17 秒事故回归）');
+  const now = 1759200000000;
+  const mk = (releaseAt) => gateGrabber({ now, releaseAt, targetDate: '2026-10-27' });
+
+  t('★ 开闸前 5 秒 → 500ms 一次（别在放场那一刻睡 15 秒）', () => {
+    assert.strictEqual(mk(now + 5000)._idleSleepMs(15000), 500);
+  });
+
+  t('开闸前 59 秒 → 500ms 一次', () => {
+    assert.strictEqual(mk(now + 59000)._idleSleepMs(15000), 500);
+  });
+
+  t('开闸前 61 秒（还在收尾窗口外）→ 保持 idlePollMs', () => {
+    assert.strictEqual(mk(now + 61000)._idleSleepMs(15000), 15000);
+  });
+
+  t('开闸前 30 分钟 → 保持 idlePollMs', () => {
+    assert.strictEqual(mk(now + 1800000)._idleSleepMs(15000), 15000);
+  });
+
+  t('★ 已过点 60 秒（服务端放场延迟）→ 仍按 500ms 盯', () => {
+    assert.strictEqual(mk(now - 60000)._idleSleepMs(15000), 500);
+  });
+
+  t('过了放场宽限期（180s）→ 退回常态，不拿过期 releaseAt 空打', () => {
+    assert.strictEqual(mk(now - 600000)._idleSleepMs(15000), 15000);
+  });
+
+  t('不知道放场时刻 → 用传入的常态间隔', () => {
+    assert.strictEqual(mk(null)._idleSleepMs(15000), 15000);
+  });
+
+  t('闸门关闭分支（base 2000）在收尾窗口内也会收紧到 500ms', () => {
+    assert.strictEqual(mk(now + 3000)._idleSleepMs(2000), 500);
+  });
 }
 
 function gateTests() {
@@ -844,7 +934,7 @@ async function orderNoTests() {
 async function online() {
   section('9. 联网（验证服务端在线 + 鉴权闸门生效，不需要 token）');
   const c = new ApiClient({
-    baseUrl: 'https://example.invalid',
+    baseUrl: 'https://tygyypt.blcu.edu.cn',
     prefix: '/service/appointment/appointment',
     minInterval: 0,
     timeout: 15000,
@@ -874,13 +964,13 @@ async function online() {
 
   await ta('鉴权分层：无 token → 403；伪造 token → 401', async () => {
     const c2 = new ApiClient({
-      baseUrl: 'https://example.invalid',
+      baseUrl: 'https://tygyypt.blcu.edu.cn',
       prefix: '/service/appointment/appointment',
       minInterval: 0,
       token: 'BOGUS_TOKEN_FOR_SELFTEST',
     });
     await assert.rejects(
-      () => c2.callRaw('/phone/getBookingTimeRange', { nodeid: '<场馆nodeid>' }, { retries: 0 }),
+      () => c2.callRaw('/phone/getBookingTimeRange', { nodeid: '1241984413986988032' }, { retries: 0 }),
       (e) => {
         assert.strictEqual(e.status, 401, `伪造 token 预期 401，实际 ${e.status}`);
         assert.strictEqual(e.kind, 'auth', '401 应被归类为鉴权错误');
@@ -892,7 +982,7 @@ async function online() {
 
 // ───────────────────────── 运行 ─────────────────────────
 (async () => {
-  console.log('本校 抢场脚本 · 自检');
+  console.log('BLCU 抢场脚本 · 自检');
   console.log('='.repeat(70));
 
   // ── 命令行指定时间段（--window / --slots）──
@@ -1038,6 +1128,8 @@ async function online() {
   await payTests();
   await loginTests();
   gateTests();
+  pollTests();
+  await burstInsuranceTests();
   await orderNoTests();
 
   if (process.argv.includes('--offline')) {
