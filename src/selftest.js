@@ -774,6 +774,85 @@ function pollTests() {
   });
 }
 
+/**
+ * 2026-10-28 实测：放场窗口由服务端在 08:00:01.1 才滚开，但候场循环「看到窗口滚开」
+ * 之后还要再睡满 500ms 才复查，于是 08:00:02.0 才转入冲刺。
+ * 修复：① 闸门开着 + 复查拿到滚开后的网格 → 当场冲刺，不再多睡一拍；
+ *       ② 离放场时刻 ±releaseRaceMs 内不睡，连着快查（窗口一滚开，下一轮就看得到）。
+ */
+async function releaseRaceTests() {
+  section('8e. 放场瞬间：看到窗口滚开就冲刺（2026-10-28 晚 1 秒回归）');
+  const { Grabber } = require('./grab');
+
+  function mk({ now, releaseAt, targetDate, windowFrom, windowTo, serverToday, schedule }) {
+    const log = { file: null, info() {}, warn() {}, error() {}, debug() {}, section() {} };
+    const g = new Grabber(
+      { target: {}, net: {}, auth: { token: '' }, safety: {}, pay: {}, paths: {}, schedule: schedule || {} },
+      log,
+      {}
+    );
+    g.targetDate = targetDate;
+    g.releaseAt = releaseAt;
+    g._serverToday = serverToday;
+    g.clock = { now: () => now, offset: 0, calibrate: () => {} };
+    g.grid = {
+      dateFields: { bookingStartDate: windowFrom, bookingEndDate: windowTo, bookingStartTime: '08:00' },
+    };
+    g._guardDeadline = now + 60000;
+    g.fetchGridRetry = async () => ({
+      ok: true,
+      grid: {
+        courts: [{ id: 'c1', name: '羽毛球场地1' }],
+        dateFields: { bookingStartDate: windowFrom, bookingEndDate: '2026-11-03', bookingStartTime: '08:00' },
+        slots: [{ value: '16:00-17:00', bookableCount: 3 }],
+      },
+    });
+    return { g };
+  }
+
+  const now = 1761955200000;
+
+  await ta('★ 闸门关着、复查一看到窗口滚开 → 立刻返回，不再多睡 500ms 再拉一次', async () => {
+    // 目标 11-03 还没进窗口（窗口 10-29~11-02），服务端今天 11-02 仍在窗口内 ⇒ 闸门关
+    const { g } = mk({ now, releaseAt: now - 1000, targetDate: '2026-11-03',
+      windowFrom: '2026-10-29', windowTo: '2026-11-02', serverToday: '2026-11-02' });
+    const t0 = Date.now();
+    const out = await g._idleWaitForRelease();
+    const ms = Date.now() - t0;
+    assert.ok(out && out.dateFields && out.dateFields.bookingEndDate === '2026-11-03', '应返回滚开后的网格');
+    assert.ok(ms < 400, `应在第一个复查周期内返回（实测 ${ms}ms），而不是再睡满 500ms`);
+  });
+
+  await ta('★ 放场瞬间快通道：±releaseRaceMs 内不睡，窗口一开就返回', async () => {
+    const { g } = mk({ now: now + 1000, releaseAt: now, targetDate: '2026-11-03',
+      windowFrom: '2026-10-29', windowTo: '2026-11-03', serverToday: '2026-10-29',
+      schedule: { releaseRaceMs: 5000, idlePollMs: 15000 } });
+    const t0 = Date.now();
+    const out = await g._idleWaitForRelease();
+    const ms = Date.now() - t0;
+    assert.ok(out, '应返回网格');
+    assert.ok(ms < 400, `快通道下不该再睡 500ms（实测 ${ms}ms）`);
+  });
+
+  await ta('关掉快通道（releaseRaceMs=0）→ 退回「睡一拍再查」的老节奏', async () => {
+    const { g } = mk({ now: now + 1000, releaseAt: now, targetDate: '2026-11-03',
+      windowFrom: '2026-10-29', windowTo: '2026-11-03', serverToday: '2026-10-29',
+      schedule: { releaseRaceMs: 0, idlePollMs: 15000 } });
+    const t0 = Date.now();
+    await g._idleWaitForRelease();
+    const ms = Date.now() - t0;
+    assert.ok(ms >= 400, `关闭快通道时应保留 500ms 节奏（实测 ${ms}ms）`);
+  });
+
+  t('快通道的边界：放场前 4s 在窗口内，前 6s 已出窗口', () => {
+    const base = { now, targetDate: '2026-11-03', windowFrom: '2026-10-29', windowTo: '2026-10-31', serverToday: '2026-10-31', schedule: { releaseRaceMs: 5000 } };
+    const a = mk({ ...base, releaseAt: now + 4000 }).g;
+    const b = mk({ ...base, releaseAt: now + 6000 }).g;
+    assert.strictEqual(a._releaseRace(), true);
+    assert.strictEqual(b._releaseRace(), false);
+  });
+}
+
 function gateTests() {
   section('8. 放场闸门（放场前绝不下单 —— 10-11 事故回归）');
 
@@ -1130,6 +1209,7 @@ async function online() {
   gateTests();
   pollTests();
   await burstInsuranceTests();
+  await releaseRaceTests();
   await orderNoTests();
 
   if (process.argv.includes('--offline')) {

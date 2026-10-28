@@ -250,6 +250,7 @@ class Grabber {
     this.targets = [];
     this.grid = null;     // 最近一次的 parseNodeAppointGrid 结果
     this.releaseAt = null;
+    this._releaseSeenAt = null; // 候场里「刚看到放场窗口滚开」的时刻（避免放场瞬间重复拉网格）
     this.result = {
       at: Date.now(),
       targetDate: null,
@@ -1170,6 +1171,19 @@ class Grabber {
     return baseMs;
   }
 
+  /**
+   * 是否处在「放场瞬间快通道」：离 releaseAt 不到 ±releaseRaceMs。
+   * 这段里候场不再按 idlePollMs/finalPollMs 睡，而是连着一轮一轮快查 ——
+   * 服务端什么时候把窗口滚开，我们下一轮就看得到，不必再等满一个复查周期。
+   */
+  _releaseRace() {
+    const sched = this.cfg.schedule || {};
+    const raceMs = Math.max(Number(sched.releaseRaceMs || 0) || 0, 0);
+    if (!raceMs || !this.releaseAt) return false;
+    const left = this.releaseAt - this.clock.now();
+    return left <= raceMs && left > -raceMs;
+  }
+
   async _idleWaitForRelease() {
     const sched = this.cfg.schedule || {};
     const idleMs = Math.max(Number(sched.idlePollMs || 15000), 5000);
@@ -1218,13 +1232,25 @@ class Grabber {
         }
         // 闸门关着时窗口大概还没滚，网格几乎每刻都在变 —— 用快节奏复查，
         // 否则「真正开闸」那一刻可能正好落在 15 秒的盲区里。
-        await this._recheckTargetGrid(last).then((g) => { if (g) last = g; });
-        // ★ 收尾窗口内别按 2 秒走 —— 开闸那一刻要尽早上来
-        await sleep(this._idleSleepMs(2000));
+        const fresh = await this._recheckTargetGrid(last);
+        // ★ 2026-10-28 实测：这里原来把复查结果丢掉、继续睡 500ms 再拉一次，
+        //   于是「服务端 08:00:01.1 滚开窗口」到「08:00:02.0 转入冲刺」白等一个周期。
+        //   现在只要拿到滚开后的网格、且闸门确实已开，就当场冲刺，不再多睡一拍。
+        if (fresh) {
+          last = fresh;
+          if (this._gateOpen()) {
+            this._releaseSeenAt = this.clock.now();
+            this.log.info(`  目标日期 ${this.targetDate} 已进入放场窗口 → 立即转入冲刺`);
+            return last;
+          }
+        }
+        // 放场瞬间（±releaseRaceMs）连查 250ms 一轮，其余收尾时间按 500ms 查
+        await sleep(this._releaseRace() ? 250 : this._idleSleepMs(2000));
         continue;
       }
 
-      await this._sleepKeepingTokenFresh(this._idleSleepMs(idleMs));
+      // ★ 放场瞬间快通道：±releaseRaceMs 内不睡，直接连查（见 _releaseRace 的说明）
+      if (!this._releaseRace()) await this._sleepKeepingTokenFresh(this._idleSleepMs(idleMs));
       try {
         const g = await this.fetchGridRetry(this.targetDate, 1);
         if (g.ok) {
@@ -1232,6 +1258,7 @@ class Grabber {
           this._targetGrid = g.grid;
           this.grid = g.grid;
           if (this._windowGuard(g.grid)) {
+            this._releaseSeenAt = this.clock.now();
             this.log.info(`  目标日期 ${this.targetDate} 已进入放场窗口 → 立即转入冲刺`);
             return last;
           }
@@ -1581,7 +1608,7 @@ class Grabber {
     } else {
       this.log.info('待命：服务端未给出放场时刻（目标日期可能还没放出来）→ 按候场逻辑复查');
     }
-    await this._idleWaitForRelease();
+    const seen = await this._idleWaitForRelease();
     if (this.releaseAt) {
       const rest = this.releaseAt - leadMs - this.clock.now();
       if (rest > 0) {
@@ -1589,13 +1616,18 @@ class Grabber {
         await this._sleepKeepingTokenFresh(rest);
       }
     }
-    // 睡醒后立刻重拉一次（放场瞬间窗口已翻开）
-    try {
-      const g = await this.fetchGridRetry(this.targetDate, 1);
-      if (g.ok) this.log.info(`放场时刻已到，网格已刷新（${g.grid.courts.length} 片场地）`);
-      else this.log.warn(`放场时刻已到，但网格仍不可用：${g.message}（继续冲刺轮询）`);
-    } catch (e) {
-      this.log.warn(`放场后预拉网格失败：${e.message}（继续冲刺轮询）`);
+    // ★ 候场里刚拿到过网格（2 秒内）就别再拉一次：放场瞬间那一拉相当于白等半秒。
+    if (seen && this._releaseSeenAt && this.clock.now() - this._releaseSeenAt <= 2000) {
+      this.log.info(`放场时刻已到，网格已刷新（${((seen && seen.courts) || []).length} 片场地）`);
+    } else {
+      // 睡醒后立刻重拉一次（放场瞬间窗口已翻开）
+      try {
+        const g = await this.fetchGridRetry(this.targetDate, 1);
+        if (g.ok) this.log.info(`放场时刻已到，网格已刷新（${g.grid.courts.length} 片场地）`);
+        else this.log.warn(`放场时刻已到，但网格仍不可用：${g.message}（继续冲刺轮询）`);
+      } catch (e) {
+        this.log.warn(`放场后预拉网格失败：${e.message}（继续冲刺轮询）`);
+      }
     }
   }
 
