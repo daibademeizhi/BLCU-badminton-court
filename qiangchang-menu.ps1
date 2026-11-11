@@ -86,7 +86,8 @@ function Invoke-RouterRaw([string]$Action) {
     Write-Host $T.keyMissingB -ForegroundColor DarkGray
     return @{ code = 126; out = @() }
   }
-  $lines = & ssh -i $Key -o StrictHostKeyChecking=no -o UserKnownHostsFile=$Known -o LogLevel=ERROR -o ConnectTimeout=20 $Remote "$Ctl $Action" 2>&1 |
+  # -n：别让 ssh 把调用方的 stdin（菜单的管道输入）读走，否则 Read-Host 会立刻 EOF
+  $lines = & ssh -n -i $Key -o StrictHostKeyChecking=no -o UserKnownHostsFile=$Known -o LogLevel=ERROR -o ConnectTimeout=20 $Remote "$Ctl $Action" 2>&1 |
     ForEach-Object { [string]$_ }
   $code = $LASTEXITCODE
   if ($null -eq $lines) { $lines = @() }
@@ -547,6 +548,61 @@ function Page-Buy {
   }
 }
 
+# ── 退款页：列出未使用订单 → 选一条 → 确认 → 调 cancel（2026-11-11 新增）──
+function Page-Refund {
+  Show-Header $T.rfTitle
+  Write-Host $T.rfLoading -ForegroundColor DarkGray
+  $data = Invoke-State 'orders'
+  if ($null -eq $data) {
+    Write-Host $T.rfOffline -ForegroundColor Red
+    Pause-Key
+    return
+  }
+  $orders = @($data.orders)
+  Show-Header $T.rfTitle
+  if ($orders.Count -eq 0) {
+    Write-Host ''
+    Write-Host $T.rfEmpty -ForegroundColor DarkGray
+    Pause-Key
+    return
+  }
+  Write-Host $T.rfListTitle
+  Write-Host ''
+  for ($i = 0; $i -lt $orders.Count; $i++) {
+    $o = $orders[$i]
+    Write-Host ('    [' + ($i + 1) + '] ' + [string]$o.bookingtime + '   ' + [string]$o.nodename + '   ' + [string]$o.txamt + $T.rfUnit + '   ' + [string]$o.statusText)
+  }
+  Write-Host ('    [0] ' + $T.pr0)
+  Write-Host ''
+  $line = Read-Line $T.rfAsk
+  if ($null -eq $line) { return }
+  $c = $line.Trim()
+  if ($c -eq '') { return }
+  $idx = 0
+  if (-not [int]::TryParse($c, [ref]$idx)) {
+    Write-Host $T.badChoice -ForegroundColor Yellow
+    Start-Sleep -Seconds 1
+    return
+  }
+  if ($idx -lt 1 -or $idx -gt $orders.Count) { return }
+  $o = $orders[$idx - 1]
+  $lines = @(
+    ('     ' + [string]$o.bookingtime + '   ' + [string]$o.nodename),
+    ('     ' + [string]$o.txamt + $T.rfUnit + '   订单 ' + [string]$o.orderno + '   状态 ' + [string]$o.statusText),
+    $T.rfConfirmNote
+  )
+  if (-not (Confirm-Yes $T.rfConfirmTitle $lines)) { return }
+  $r = Invoke-RouterRaw ('cancel ' + [string]$o.bookingno + ' --yes')
+  Write-Host ''
+  if ($r.code -eq 0) {
+    Write-Host $T.rfCancelled -ForegroundColor Green
+  } else {
+    Write-Host ($r.out -join ' ') -ForegroundColor Red
+    Write-Host $T.rfFailed -ForegroundColor Yellow
+  }
+  Pause-Key
+}
+
 # ══════════════════════ 主循环 ══════════════════════
 if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
   Write-Host ''
@@ -639,6 +695,7 @@ while (-not $quit) {
   Write-Host $T.p3 -ForegroundColor Yellow
   Write-Host $T.p4
   Write-Host $T.p5
+  Write-Host $T.p6
   Write-Host $T.m0
   Write-Host ''
   Write-Host $T.noteA -ForegroundColor DarkGray
@@ -678,6 +735,7 @@ while (-not $quit) {
   elseif ($c -eq '3') { Page-Buy }
   elseif ($c -eq '4') { Page-Priority }
   elseif ($c -eq '5') { Page-Status }
+  elseif ($c -eq '6') { Page-Refund }
   elseif ($c -eq '0') { $quit = $true }
   else {
     Write-Host $T.badChoice -ForegroundColor Yellow

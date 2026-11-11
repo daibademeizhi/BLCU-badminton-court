@@ -1041,6 +1041,57 @@ function pollTests() {
  * 修复：① 闸门开着 + 复查拿到滚开后的网格 → 当场冲刺，不再多睡一拍；
  *       ② 离放场时刻 ±releaseRaceMs 内不睡，连着快查（窗口一滚开，下一轮就看得到）。
  */
+function refundTests() {
+  section('8k. 退订退款（接口 payload 与状态守卫，2026-11-11 新增）');
+  const { statusText, isRefundable, normalizeItem, buildCancelPayload, parseArgs } = require('./refund');
+
+  t('★ 取消 payload 的 txamt 必须取详情的 payallamt（整笔 4000 分），不是列表单时段 txamt', () => {
+    const detail = { id: '1437600235768782848', payallamt: '4000', booktype: '2', payway: '一卡通', txamt: '2000' };
+    const p = buildCancelPayload(detail);
+    assert.deepStrictEqual(p, { id: '1437600235768782848', txamt: '4000', booktype: '2', payway: '一卡通' });
+  });
+
+  t('带 remark 时附 cancelremark', () => {
+    const p = buildCancelPayload({ id: 'a', payallamt: '2000', booktype: '2', payway: '一卡通' }, ' 买错了 ');
+    assert.strictEqual(p.cancelremark, '买错了');
+    assert.strictEqual(buildCancelPayload({ id: 'a', payallamt: '2000' }, '   ').cancelremark, undefined);
+  });
+
+  t('只有 status=1（未使用）可退；已退款/已使用/排队中一律不碰', () => {
+    assert.strictEqual(isRefundable({ status: '1' }), true);
+    for (const s2 of ['2', '8', '12', '', null, undefined]) assert.strictEqual(isRefundable({ status: s2 }), false);
+    assert.strictEqual(isRefundable(null), false);
+  });
+
+  t('状态文案：1 未使用 / 2 已退款 / 8 已使用 / 12 排队中 / 未知回显原值', () => {
+    assert.strictEqual(statusText('1'), '未使用');
+    assert.strictEqual(statusText('2'), '已退款');
+    assert.strictEqual(statusText('8'), '已使用');
+    assert.strictEqual(statusText('12'), '排队中');
+    assert.strictEqual(statusText('99'), '状态99');
+  });
+
+  t('列表项归一化：字段缺失不炸，index 从 1 开始', () => {
+    const o = normalizeItem({ bookingno: 255477, txamt: '20.00', status: '1' }, 0);
+    assert.strictEqual(o.index, 1);
+    assert.strictEqual(o.bookingno, '255477');
+    assert.strictEqual(o.orderno, '');
+    assert.strictEqual(o.statusText, '未使用');
+    assert.strictEqual(o.refundable, true);
+  });
+
+  t('命令行解析：--booking 单条预览 / --yes 才真退 / --orderno 整笔', () => {
+    const a = parseArgs(['--booking', '255477']);
+    assert.strictEqual(a.booking, '255477');
+    assert.strictEqual(a.yes, false);
+    assert.strictEqual(parseArgs(['--booking=255477', '--yes']).yes, true);
+    const b = parseArgs(['--orderno=134645', '--yes', '--json', '--remark', '买错了']);
+    assert.strictEqual(b.orderno, '134645');
+    assert.strictEqual(b.json, true);
+    assert.strictEqual(b.remark, '买错了');
+  });
+}
+
 async function releaseRaceTests() {
   section('8e. 放场瞬间：看到窗口滚开就冲刺（2026-10-28 晚 1 秒回归）');
   const { Grabber } = require('./grab');
@@ -1474,6 +1525,7 @@ async function online() {
   await probeTests();
   await burstBudgetTests();
   await strictSettleTests();
+  refundTests();
   await releaseRaceTests();
   await orderNoTests();
 

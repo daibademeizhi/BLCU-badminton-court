@@ -45,6 +45,24 @@ case "$CMD" in
     sh /root/blcu/toggle.sh on >/dev/null 2>&1
     exec node state.js plan
     ;;
+  # ── 订单 / 退订退款（2026-11-11：「帮我加入退款功能」）────────────────
+  #   orders                 列出未使用（可退）的订单，输出 JSON
+  #   orders --all           连已退款/已使用的也列出来
+  #   cancel <bookingno>     预览这条订单（不退）
+  #   cancel <bookingno> --yes   真退这一条（一小时）
+  #   cancel --orderno 134645 --yes  退这一笔订单下所有未使用时段
+  orders)
+    node src/refund.js --list --json "$@"
+    ;;
+  cancel)
+    [ $# -gt 0 ] || { echo '{"ok":false,"error":"cancel 需要 bookingno（或 --orderno <订单号> --yes）"}'; exit 2; }
+    case "$1" in
+      --orderno) node src/refund.js --orderno "$2" --yes --json ;;
+      --booking) node src/refund.js --booking "$2" --yes --json ;;
+      --yes)     echo '{"ok":false,"error":"cancel 后面要先给 bookingno，例如：cancel 255477 --yes"}'; exit 2 ;;
+      *)         node src/refund.js --booking "$1" --json "$@" ;;
+    esac
+    ;;
   # 关掉自动抢场，并把「这一次」的临时优先级清掉（下次开抢重新选）
   disarm)
     sh /root/blcu/toggle.sh off >/dev/null 2>&1

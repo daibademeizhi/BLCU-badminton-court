@@ -58,7 +58,7 @@ const T = {
   title: '   羽毛球场抢场 · 控制台',
   prompt: '  请输入序号再回车',
   eofBye: '  输入已经读完（非交互运行），先退出了。',
-  badChoice: '  [!] 没看懂这个序号，请输入 0-5。',
+  badChoice: '  [!] 没看懂这个序号，请输入 0-6。',
   bye: '  再见。',
   backToMenu: '按回车回去',
   opDone: '  操作结束（退出码 ',
@@ -76,6 +76,18 @@ const T = {
   p3: '    [3] 现在马上抢     看三天还剩哪些场，挑一个直接拿下（真下单 + 自动付款）',
   p4: '    [4] 改默认优先级   先抢哪两小时、后抢哪两小时（明天有课就改一下顺序）',
   p5: '    [5] 状态与日志     开关、上次结果、今天的抢场日志',
+  p6: '    [6] 退订退款       把买错的场退掉，钱原路退回一卡通',
+  rfTitle: '退订退款',
+  rfLoading: '  正在查订单…',
+  rfEmpty: '  没有未使用的订单 —— 都已经退款或者用完了。',
+  rfListTitle: '  可以退的订单（挑一个序号）：',
+  rfAsk: '  要退哪一个？（序号；0 = 返回）',
+  rfConfirmTitle: '确认退掉这一条？',
+  rfConfirmNote: '     退掉后座位马上放出来，钱原路退回一卡通余额。',
+  rfCancelled: '  ✓ 已经退了，座位已释放，钱原路退回。',
+  rfFailed: '  [!] 没退成功（上面写着原因）。',
+  rfUnit: ' 元',
+  rfOffline: '  [!] 连不上软路由 / 读不到订单。',
   m0: '    [0] 退出',
   noteA: '  说明：开抢之后，每天早上 07:45 自动抢「三天后的场地」，08:05 再补一枪；',
   noteB: '        抢到一次就自动关掉，不会无限下单。菜单本身不会下单，除非你点了 [3]。',
@@ -286,7 +298,8 @@ function Invoke-RouterRaw([string]$Action) {
     Write-Host $T.keyMissingB -ForegroundColor DarkGray
     return @{ code = 126; out = @() }
   }
-  $lines = & ssh -i $Key -o StrictHostKeyChecking=no -o UserKnownHostsFile=$Known -o LogLevel=ERROR -o ConnectTimeout=20 $Remote "$Ctl $Action" 2>&1 |
+  # -n：别让 ssh 把调用方的 stdin（菜单的管道输入）读走，否则 Read-Host 会立刻 EOF
+  $lines = & ssh -n -i $Key -o StrictHostKeyChecking=no -o UserKnownHostsFile=$Known -o LogLevel=ERROR -o ConnectTimeout=20 $Remote "$Ctl $Action" 2>&1 |
     ForEach-Object { [string]$_ }
   $code = $LASTEXITCODE
   if ($null -eq $lines) { $lines = @() }
@@ -747,6 +760,61 @@ function Page-Buy {
   }
 }
 
+# ── 退款页：列出未使用订单 → 选一条 → 确认 → 调 cancel（2026-11-11 新增）──
+function Page-Refund {
+  Show-Header $T.rfTitle
+  Write-Host $T.rfLoading -ForegroundColor DarkGray
+  $data = Invoke-State 'orders'
+  if ($null -eq $data) {
+    Write-Host $T.rfOffline -ForegroundColor Red
+    Pause-Key
+    return
+  }
+  $orders = @($data.orders)
+  Show-Header $T.rfTitle
+  if ($orders.Count -eq 0) {
+    Write-Host ''
+    Write-Host $T.rfEmpty -ForegroundColor DarkGray
+    Pause-Key
+    return
+  }
+  Write-Host $T.rfListTitle
+  Write-Host ''
+  for ($i = 0; $i -lt $orders.Count; $i++) {
+    $o = $orders[$i]
+    Write-Host ('    [' + ($i + 1) + '] ' + [string]$o.bookingtime + '   ' + [string]$o.nodename + '   ' + [string]$o.txamt + $T.rfUnit + '   ' + [string]$o.statusText)
+  }
+  Write-Host ('    [0] ' + $T.pr0)
+  Write-Host ''
+  $line = Read-Line $T.rfAsk
+  if ($null -eq $line) { return }
+  $c = $line.Trim()
+  if ($c -eq '') { return }
+  $idx = 0
+  if (-not [int]::TryParse($c, [ref]$idx)) {
+    Write-Host $T.badChoice -ForegroundColor Yellow
+    Start-Sleep -Seconds 1
+    return
+  }
+  if ($idx -lt 1 -or $idx -gt $orders.Count) { return }
+  $o = $orders[$idx - 1]
+  $lines = @(
+    ('     ' + [string]$o.bookingtime + '   ' + [string]$o.nodename),
+    ('     ' + [string]$o.txamt + $T.rfUnit + '   订单 ' + [string]$o.orderno + '   状态 ' + [string]$o.statusText),
+    $T.rfConfirmNote
+  )
+  if (-not (Confirm-Yes $T.rfConfirmTitle $lines)) { return }
+  $r = Invoke-RouterRaw ('cancel ' + [string]$o.bookingno + ' --yes')
+  Write-Host ''
+  if ($r.code -eq 0) {
+    Write-Host $T.rfCancelled -ForegroundColor Green
+  } else {
+    Write-Host ($r.out -join ' ') -ForegroundColor Red
+    Write-Host $T.rfFailed -ForegroundColor Yellow
+  }
+  Pause-Key
+}
+
 # ══════════════════════ 主循环 ══════════════════════
 if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
   Write-Host ''
@@ -839,6 +907,7 @@ while (-not $quit) {
   Write-Host $T.p3 -ForegroundColor Yellow
   Write-Host $T.p4
   Write-Host $T.p5
+  Write-Host $T.p6
   Write-Host $T.m0
   Write-Host ''
   Write-Host $T.noteA -ForegroundColor DarkGray
@@ -878,6 +947,7 @@ while (-not $quit) {
   elseif ($c -eq '3') { Page-Buy }
   elseif ($c -eq '4') { Page-Priority }
   elseif ($c -eq '5') { Page-Status }
+  elseif ($c -eq '6') { Page-Refund }
   elseif ($c -eq '0') { $quit = $true }
   else {
     Write-Host $T.badChoice -ForegroundColor Yellow

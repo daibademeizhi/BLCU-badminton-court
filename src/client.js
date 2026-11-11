@@ -435,9 +435,20 @@ class ApiClient {
    *    保留此注释是为了避免以后有人再照旧名去试一遍。
    */
 
-  /** 取消预约 */
+  /** 取消预约（= 退订退款，钱原路退回；payload 见 src/refund.js 的 buildCancelPayload） */
   userCancelBooking(p) {
     return this.call('/phone/userCancelBooking', p);
+  }
+
+  /**
+   * 订单详情（前端 `pages-custom-order-orderDetail`）。
+   *
+   * 参数实测：`{bookingno, id}`（`id` 是列表项里的 `id`，也就是 resid；只给 orderno 会报「参数id为空」）。
+   * 返回里退订要用的是：`id`、`payallamt`（★ 取消接口的 txamt 取它，不是列表的 txamt）、
+   * `booktype`、`payway`、`status`（1=未使用 2=已退款 8=已使用）、`bookingno`、`bookingtime`、`nodename`。
+   */
+  payOrderDetails(p) {
+    return this.call('/phone/payOrderDetails', p, { retries: 1 });
   }
 
   /** 审批必要性检查 */
