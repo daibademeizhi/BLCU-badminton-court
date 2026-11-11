@@ -257,9 +257,22 @@ function ymd8(ms) {
 function cmdPlan() {
   const DAY = 86400000;
   const now = Date.now();
-  const target = ymd8(now + 2 * DAY);           // 明天 07:45 抢的是 T+2
-  const weekday = WEEKDAY[new Date(now + 2 * DAY + 8 * 3600e3).getUTCDay()];
-  const runDay = ymd8(now + DAY);
+  const TZ = 8 * 3600e3;
+  // ★ 2026-11-11 修正：以前写死「today+2」，于是下午看面板会说「明早抢 11/13」，
+  //   可明早 11/12 07:45 跑的是 T+2 = 11/14。这里先算出「下一次真会跑的时刻」：
+  //     · 今天 07:45 之前   → 今天 07:45（今天这一枪还没打）
+  //     · 07:45–08:05 之间 → 今天 08:05（主任务刚打完，等兜底）
+  //     · 08:05 之后       → 明天 07:45
+  //   再按「跑的那天 + 2」推目标日期。
+  const bj = new Date(now + TZ);
+  const hhmm = bj.getUTCHours() * 100 + bj.getUTCMinutes();
+  let pendingOffset = 1;                 // 相对今天的天数
+  if (hhmm < 745) pendingOffset = 0;
+  else if (hhmm < 805) pendingOffset = 0;
+  const targetMs = now + (pendingOffset + 2) * DAY;
+  const target = ymd8(targetMs);
+  const weekday = WEEKDAY[new Date(targetMs + TZ).getUTCDay()];
+  const runDay = ymd8(now + pendingOffset * DAY);
 
   let priority = [];
   let source = 'config';
@@ -296,6 +309,8 @@ function cmdPlan() {
     weekday,
     runAt: runDay + ' 07:45',
     rescueAt: runDay + ' 08:05',
+    // 现在这一刻真正等着的是哪一枪（07:45 之后、08:05 之前就是兜底）
+    pending: hhmm < 745 ? 'run' : (hhmm < 805 ? 'rescue' : 'run-tomorrow'),
     priority,
     prioritySource: source,
     // 定时抢一律走严格模式：优先级里凑不出连续空场就如实报没抢到，绝不捡别的时间段。
