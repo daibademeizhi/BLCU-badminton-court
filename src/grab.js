@@ -223,6 +223,8 @@ BLCU 羽毛球抢场脚本
       --priority <时段>   按顺序试的**偏好**列表，如 --priority 16:00-18:00,17:00-19:00
                           ★ 与 --window 的区别：--window 是约束（只在里面选、没有就收手），
                             --priority 是偏好（都落空时仍允许兜底到当天其它空档）
+      --strict            优先级模式也不兜底：优先级窗口都凑不出方案就如实报没抢到，
+                          绝不改抢当天其它空档（定时任务默认带它，见 2026-11-11 事故）
       --court <场地id>    点名某一片场地（其余场地不进候选）。配合菜单「挑场地」用
       --no-wait           不等放场，现在不能下单就直接失败（「帮买」用）
       --interval <ms>     覆盖冲刺轮询间隔（默认 configuration schedule.burstPollMs）
@@ -337,7 +339,10 @@ class Grabber {
     let last = null;
     for (let i = 0; i < tries; i++) {
       try {
-        return await this.fetchGrid(date);
+        const r = await this.fetchGrid(date);
+        // 能拉到网格 = 平台对我们这个会话是通的 → 5xx 连击计数清零。
+        this._idle5xxStreak = 0;
+        return r;
       } catch (e) {
         last = e;
         this.log.warn(`  拉网格第 ${i + 1}/${tries} 次失败：${e.message}`);
@@ -721,8 +726,15 @@ class Grabber {
     // ★★ 但命令行/菜单**明确指定了时间段**（--window）时必须关掉它：
     //   用户说了「只要 18:00-20:00」，脚本就不该在它满场时偷偷去抢早上 08:00 ——
     //   那正是他要这个功能想避免的事。严格模式下宁可如实报「没抢到」。
+    //
+    // ★★ 2026-11-11：--strict / config.safety.noFallback 让「优先级模式」也不兜底。
+    //   事故：07:45 主任务被平台连续 500 打死 → 08:30 兜底脚本看到优先级全满，
+    //   兜底逻辑就把当天仅剩的 08:00-10:00 买了下来（11/09 还买过 21:00-22:00 的 1 小时残单）。
+    //   用户的诉求是「优先级里凑不出就空手」，宁可没抢到也不要买错的场。
     const strictWindow = !!(this.opts && this.opts.windows && this.opts.windows.length);
-    const fallbackRange = strictWindow ? null : this._fallbackRange(g.dateFields, day);
+    const noFallback = !!((this.opts && this.opts.noFallback)
+      || (this.cfg && this.cfg.safety && this.cfg.safety.noFallback));
+    const fallbackRange = (strictWindow || noFallback) ? null : this._fallbackRange(g.dateFields, day);
     // ★ 最少段数：配置显式写的值优先，服务端 minSelect 只在配置留空时用，最后兜底 2。
     //   ★ 2026-10-11 起配置写的是 1（用户改成「两片场地各 1 小时」= 每条候选 1 个时段）。
     //   留空时的兜底 2 是保守默认：宁可跑空也不下 1 小时残单（服务端 minSelect 实测 "1"）。
@@ -1244,8 +1256,11 @@ class Grabber {
             return last;
           }
         }
-        // 放场瞬间（±releaseRaceMs）连查 250ms 一轮，其余收尾时间按 500ms 查
-        await sleep(this._releaseRace() ? 250 : this._idleSleepMs(2000));
+        // ★ 2026-11-11 事故：这里原来是 2 秒一轮（≈30 次/分），放场前 15 分钟就打了
+        //   四五百次 —— 平台从那天开始连续三天在 07:45 前后把我们打成 500。
+        //   现在按正常候场节奏（idlePollMs=15s；最后 60 秒才收紧到 500ms）走，
+        //   放场即刻靠 ±releaseRaceMs 的快通道兜住，不再白白烧请求。
+        await sleep(this._releaseRace() ? 250 : this._idleSleepMs(idleMs));
         continue;
       }
 
@@ -1306,9 +1321,24 @@ class Grabber {
   async _handleIdleFetchError(e) {
     if (e instanceof ApiError && e.kind === 'auth') {
       if (!(await this._healAuth())) throw this._fatal(e, '候场期间鉴权失败');
-    } else {
-      this.log.warn(`  候场复查异常（忽略，稍后重试）：${e.message}`);
+      return;
     }
+    // ★ 2026-11-11 事故：平台对我们连续返回 500（730 次 / 18 分钟），而 08:30 的兜底脚本
+    //   重新登录后立刻恢复正常 —— 说明不是账号坏了，而是**手上这个会话被服务端判废**。
+    //   所以连续 5xx 到阈值就强制换一个新会话（force 换发 token），不要干耗到候场超时。
+    const is5xx = e instanceof ApiError && Number(e.status) >= 500;
+    this._idle5xxStreak = is5xx ? (this._idle5xxStreak || 0) + 1 : 0;
+    if (is5xx && this._idle5xxStreak === 8) {
+      this.log.warn(`  连续 ${this._idle5xxStreak} 次 HTTP ${e.status}（平台侧异常），强制换一个新会话再试…`);
+      try {
+        await this._forceRelogin('连续 5xx 换会话');
+        this.log.info('  已换新会话，继续候场');
+      } catch (err) {
+        this.log.warn(`  换会话失败：${err.message}（继续按原节奏重试）`);
+      }
+      this._idle5xxStreak = 0;
+    }
+    this.log.warn(`  候场复查异常（忽略，稍后重试）：${e.message}`);
   }
 
   /**
@@ -1694,6 +1724,28 @@ class Grabber {
     }
   }
 
+  /**
+   * 强制重新登录换一个新会话（不看剩余寿命，直接 force 换发）。
+   *
+   * 为什么需要：2026-11-08 / 11-09 / 11-11 连续三次，07:45 主任务在放场前后收到
+   * 清一色 HTTP 500（约 730 次），而 08:30 兜底脚本「重新登录」之后立刻正常 ——
+   * 说明坏的是那个会话，不是账号。这里最多换 2 次，换完还 500 就只能等下一轮。
+   */
+  async _forceRelogin(reason) {
+    this._forceReloginCount = (this._forceReloginCount || 0) + 1;
+    if (this._forceReloginCount > 2) throw new Error('本次运行已换过 2 次会话，不再重试');
+    const r = await ensureToken(this.cfg, {
+      force: true,
+      log: (lvl, msg) => (lvl === 'warn' ? this.log.warn(msg) : this.log.info(msg)),
+    });
+    if (r.token) {
+      this.cfg.auth.token = r.token;
+      if (this._api) this._api.setToken(r.token);
+    }
+    this.log.info(`已强制换发新会话（${reason}）`);
+    return r;
+  }
+
   // ── 支付 ──
 
   async settle() {
@@ -1904,10 +1956,13 @@ async function main() {
     );
     log.info(`  单次下单最少 ${winInfo.minSlots} 个时段（由窗口长度与 --slots 决定）`);
   }
+  const noFallback = cli.flags.has('strict') || cli.flags.has('no-fallback');
   if (prioInfo) {
     log.info(
       `★ 优先级由命令行指定：${prioInfo.windows.map((w) => w.raw).join(' > ')}` +
-      '（按顺序试；全都不行时仍允许兜底到当天其它空档）'
+      (noFallback
+        ? '（严格模式：只按顺序试这几段，全都不行就如实报没抢到，不兜底）'
+        : '（按顺序试；全都不行时仍允许兜底到当天其它空档）')
     );
   }
   log.info(`场地优先：${config.target.courtPriority.length ? config.target.courtPriority.join(' > ') : '（不限）'}`);
@@ -1946,6 +2001,9 @@ async function main() {
     //   只改 config.target.courtPriority 那只是「排序」，其它场地照样会被尝试
     //   （2026-10-19 实测：菜单里点「羽毛球场地1」，预演仍列出场地1/3/4 四个候选）。
     court: cli.opts.court ? String(cli.opts.court) : null,
+    // ★ 2026-11-11：--strict / --no-fallback 关掉「优先级全落空就兜底到当天任意空档」。
+    //   事故：07:45 主任务被 500 打死，08:30 兜底脚本把早上 08:00-10:00 买了下来。
+    noFallback,
   });
 
   /**

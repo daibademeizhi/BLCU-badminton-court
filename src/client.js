@@ -1,10 +1,10 @@
 'use strict';
 /**
- * 本校 体育馆订场系统 API 客户端
+ * BLCU 体育馆订场系统 API 客户端
  *
  * ── 请求规范（精确复刻前端 b4a5 模块的 myRequest）────────────────────────
  *   URL     : {baseUrl}{prefix}{path}
- *             默认 https://example.invalid/service/appointment/appointment/phone/xxx
+ *             默认 https://tygyypt.blcu.edu.cn/service/appointment/appointment/phone/xxx
  *   Method  : POST
  *   Headers : Content-Type: application/json
  *             token: <JWT>                    （业务接口必需，缺失 403，失效 401）
@@ -23,7 +23,7 @@
 const https = require('https');
 const { wrap, tryDecryptBody } = require('./crypto');
 
-const NODEID_BADMINTON = '<场馆nodeid>';
+const NODEID_BADMINTON = '1241984413986988032';
 
 class ApiError extends Error {
   constructor(message, status, body, kind) {
@@ -56,7 +56,7 @@ class ApiClient {
    * @param {boolean} [opts.verbose]
    */
   constructor(opts = {}) {
-    this.baseUrl = String(opts.baseUrl || 'https://example.invalid').replace(/\/+$/, '');
+    this.baseUrl = String(opts.baseUrl || 'https://tygyypt.blcu.edu.cn').replace(/\/+$/, '');
     this.prefix = String(opts.prefix || '/service/appointment/appointment').replace(/\/+$/, '');
     this.token = opts.token || null;
     this.timeout = opts.timeout || 20000;
@@ -134,7 +134,16 @@ class ApiClient {
         }
         if (res.status !== 200) {
           this.stats.httpFail++;
-          throw new ApiError(`HTTP ${res.status}（${path}）`, res.status, res.body, 'http');
+          // ★ 2026-11-11：以前这里只记状态码，于是三天 730 次 500 全都查不出原因。
+          //   现在把响应体前 300 字符塞进错误消息（网关/PHP 报错页通常直接写在那里）。
+          let snippet = '';
+          try {
+            const s = String(res.body == null ? '' : res.body).replace(/\s+/g, ' ').trim();
+            if (s) snippet = '，响应体：' + s.slice(0, 300);
+          } catch (e) { /* ignore */ }
+          const ra = res.headers && (res.headers['retry-after'] || res.headers['Retry-After']);
+          if (ra) snippet += `，Retry-After：${ra}`;
+          throw new ApiError(`HTTP ${res.status}（${path}）${snippet}`, res.status, res.body, 'http');
         }
 
         let json = res.json;
@@ -205,7 +214,7 @@ class ApiClient {
             if (typeof this.onResponse === 'function') {
               try { this.onResponse({ path, status: res.statusCode, serverDate, json }); } catch (e) { /* 钩子异常不影响主流程 */ }
             }
-            resolve({ status: res.statusCode, json, body: raw, serverDate: serverDate || null });
+            resolve({ status: res.statusCode, json, body: raw, headers: res.headers || null, serverDate: serverDate || null });
           });
         }
       );

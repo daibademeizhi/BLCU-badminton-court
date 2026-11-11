@@ -695,6 +695,125 @@ function gateGrabber({ now, releaseAt, targetDate, windowFrom, windowTo, serverT
  * 原来的行为是直接按 burstPollMs 再打一轮（拿不完整的网格空打）；
  * 现在改为隔 100ms 重拉一次网格。只在前 3 轮生效，后面就是真的没位。
  */
+/**
+ * 2026-11-11 事故回归：--strict（禁止兜底）。
+ *
+ * 当天 07:45 主任务被平台连续 500 打死，08:30 的兜底脚本既不读菜单里的「定时抢设置」、
+ * 又允许兜底到当天任意空档，于是把 11/13 仅剩的 08:00-10:00 买了下来（11/09 还买过
+ * 21:00-22:00 的 1 小时残单）。用户要的是「优先级里凑不出就空手」。
+ * 这里钉两件事：① 默认行为不变（仍能兜底，老用户不被打断）；
+ * ② --strict / config.safety.noFallback 时 buildTargets 返回 0 个候选。
+ */
+function strictFallbackTests() {
+  section('8f. --strict 禁止兜底（2026-11-11 事故回归）');
+  const { Grabber } = require('./grab');
+
+  // 目标日 11/13：16:00-18:00 全满，只有 08:00-10:00 空着（与事故当天的网格一致）
+  function mk(opts, safety) {
+    const log = { file: null, info() {}, warn() {}, error() {}, debug() {} };
+    const cfg = {
+      target: {
+        hourPriority: [{ from: 16 * 60, to: 18 * 60, raw: '16:00-18:00', strict: false }],
+        courtPriority: [], maxSlots: 2, minSlots: 2, sameCourt: true, conflictGraceMin: 30,
+      },
+      net: {}, safety: safety || {}, pay: {}, paths: {},
+    };
+    const g = new Grabber(cfg, log, opts);
+    g.targetDate = '2026-11-13';
+    const grid = { c1: {} };
+    for (const t of ['16:00-17:00', '17:00-18:00']) grid.c1[t] = { disabled: true };
+    for (const t of ['08:00-09:00', '09:00-10:00']) grid.c1[t] = { disabled: false };
+    const pack = {
+      dateFields: { bookingStartTime: '08:00', bookingEndTime: '23:59', maxSelect: '2', minSelect: '2' },
+      courts: [{ id: 'c1', name: '羽毛球场地1', bookableTimes: ['08:00-09:00', '09:00-10:00'] }],
+      grid,
+    };
+    g._gridForTarget = () => pack;
+    g._dayBlocks = () => ({ blocks: [], free: [{ from: 480, to: 1440 }], fromMin: 480, toMin: 1440 });
+    return g;
+  }
+
+  t('默认（非严格）：优先级全满 → 追加避课空档兜底，能匹配到 08:00-10:00', () => {
+    const ts = mk({}).buildTargets();
+    assert.ok(ts.length > 0, '非严格模式应兜底出候选');
+    const labels = ts.map((x) => (x.slots || []).join('+'));
+    assert.ok(labels.includes('08:00-09:00+09:00-10:00'), '兜底应命中 08-10：' + JSON.stringify(labels));
+  });
+
+  t('★ --strict：优先级全满 → 0 个候选，不兜底', () => {
+    assert.strictEqual(mk({ noFallback: true }).buildTargets().length, 0);
+  });
+
+  t('★ config.safety.noFallback: true 同样禁止兜底（不必带命令行参数）', () => {
+    assert.strictEqual(mk({}, { noFallback: true }).buildTargets().length, 0);
+  });
+
+  t('--window 本来就是严格模式：加不加 --strict 结果一致（0 候选）', () => {
+    const win = { windows: [{ raw: '16:00-18:00', from: 16 * 60, to: 18 * 60 }] };
+    assert.strictEqual(mk(win).buildTargets().length, 0);
+    assert.strictEqual(mk(Object.assign({ noFallback: true }, win)).buildTargets().length, 0);
+  });
+}
+
+/**
+ * 2026-11-11 事故回归：连续 5xx 时换会话。
+ *
+ * 事故里 07:45 主任务被平台连续返回 500（约 730 次 / 18 分钟），而 08:30 的兜底脚本
+ * 重新登录后立刻恢复正常 —— 坏的是**那个会话**，不是账号。现在候场期间连续 8 次 5xx
+ * 就强制换一个新会话（最多 2 次），不必干耗到候场超时。
+ */
+async function fiveHundredTests() {
+  section('8g. 连续 5xx 换会话（2026-11-11 事故回归）');
+  const { Grabber } = require('./grab');
+  const { ApiError } = require('./client');
+
+  function mk() {
+    const warns = [];
+    const infos = [];
+    const log = { file: null, info: (m) => infos.push(m), warn: (m) => warns.push(m), error() {}, debug() {}, section() {} };
+    const g = new Grabber({ target: {}, net: {}, safety: {}, pay: {}, paths: {} }, log, {});
+    let relogins = 0;
+    g._forceRelogin = async () => { relogins++; };
+    return { g, warns, infos, relogins: () => relogins };
+  }
+
+  const err500 = () => new ApiError('HTTP 500（/phone/getNodeAppointInfoList）', 500, '{}', 'http');
+
+  await ta('连续 8 次 5xx → 换一次会话，并清零计数', async () => {
+    const { g, relogins } = mk();
+    for (let i = 0; i < 7; i++) await g._handleIdleFetchError(err500());
+    assert.strictEqual(relogins(), 0, '前 7 次不该换会话');
+    await g._handleIdleFetchError(err500());
+    assert.strictEqual(relogins(), 1, '第 8 次必须换会话');
+    assert.strictEqual(g._idle5xxStreak, 0, '换完要清零');
+  });
+
+  await ta('非 5xx 的普通失败不累计（4xx/网络错误）', async () => {
+    const { g, relogins } = mk();
+    for (let i = 0; i < 20; i++) {
+      await g._handleIdleFetchError(new ApiError('HTTP 502? no: 404', 404, '', 'notFound'));
+      await g._handleIdleFetchError(new ApiError('网络错误', 0, null, 'network'));
+    }
+    assert.strictEqual(relogins(), 0);
+  });
+
+  await ta('两次 5xx 连击之间夹一次「非 5xx 失败」→ 计数清零，不会误换会话', async () => {
+    const { g, relogins } = mk();
+    for (let i = 0; i < 7; i++) await g._handleIdleFetchError(err500());
+    await g._handleIdleFetchError(new ApiError('网络错误', 0, null, 'network'));  // 断链 → 清零
+    for (let i = 0; i < 7; i++) await g._handleIdleFetchError(err500());
+    assert.strictEqual(relogins(), 0, '中间断过就不该在 7 次后触发');
+  });
+
+  await ta('★ 拉到一次网格（成功）也会清零 5xx 连击', async () => {
+    const { g } = mk();
+    for (let i = 0; i < 7; i++) await g._handleIdleFetchError(err500());
+    g.fetchGrid = async () => ({ ok: true, grid: {} });
+    await g.fetchGridRetry('2026-11-13', 1);
+    assert.strictEqual(g._idle5xxStreak, 0);
+  });
+}
+
 async function burstInsuranceTests() {
   section('8d. 冲刺保险（网格有空位却 0 候选 → 100ms 后重拉网格）');
   const { Grabber } = require('./grab');
@@ -771,6 +890,10 @@ function pollTests() {
 
   t('闸门关闭分支（base 2000）在收尾窗口内也会收紧到 500ms', () => {
     assert.strictEqual(mk(now + 3000)._idleSleepMs(2000), 500);
+  });
+
+  t('闸门关闭分支用候场间隔（idleMs=15000）→ 收尾窗口外就是 15 秒', () => {
+    assert.strictEqual(mk(now + 900000)._idleSleepMs(15000), 15000);
   });
 }
 
@@ -1209,6 +1332,8 @@ async function online() {
   gateTests();
   pollTests();
   await burstInsuranceTests();
+  strictFallbackTests();
+  await fiveHundredTests();
   await releaseRaceTests();
   await orderNoTests();
 
