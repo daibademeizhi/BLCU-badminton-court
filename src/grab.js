@@ -168,6 +168,7 @@ function parseArgs(argv) {
     else if (a === '--rel') out.opts.rel = argv[++i];
     else if (a === '--expect') out.opts.expect = argv[++i];
     else if (a === '--interval') out.opts.interval = Number(argv[++i]);
+    else if (a === '--post-watch') out.opts.postWatch = Number(argv[++i]);
     else if (a === '--max-rounds') out.opts.maxRounds = Number(argv[++i]);
     // ★ --window 可重复（每次一段），也支持 --window=18:00-20:00 这种写法；
     //   一个值里用逗号分隔多段同样认（解析在 config.applyWindowOverrides 里）。
@@ -228,6 +229,7 @@ BLCU 羽毛球抢场脚本
       --court <场地id>    点名某一片场地（其余场地不进候选）。配合菜单「挑场地」用
       --no-wait           不等放场，现在不能下单就直接失败（「帮买」用）
       --interval <ms>     覆盖冲刺轮询间隔（默认 configuration schedule.burstPollMs）
+      --post-watch <分钟> 放场后仍每 20 秒复查网格，出现空场地就自动再冲一次（默认 0=不跟进）
       --max-rounds <n>    最多冲刺轮数（默认 configuration schedule.maxRounds）
       --now               忽略等待，立刻冲刺（调试用）
       --poll              安全模式：打印当前网格与放场状态后退出，不抢
@@ -1196,6 +1198,46 @@ class Grabber {
     return left <= raceMs && left > -raceMs;
   }
 
+  /**
+   * 放场前的「计划探针」：不再按固定间隔连打，只在几个计划时刻各探一次。
+   *
+   * ★ 2026-11-11 实测（软路由 tmp-ratelimit2）：
+   *   2 秒一轮 → 第 5 个请求起 HTTP 500「访问过于频繁」，封禁 30 秒以上；
+   *   15 秒一轮的长跑、60 秒一次的探针则相安无事。
+   *   所以放场前 15 分钟最多探 6 次，把请求预算全部留给放场那一刻。
+   *
+   * 返回 >0：还没到探针时刻，先睡这么多毫秒（不发请求）。
+   * 返回 0 ：到点了，循环可以发一次网格请求。
+   */
+  _nextProbeWaitMs() {
+    if (this._probePlanIdx == null) this._probePlanIdx = 0;
+    if (this._postBackoffIdx == null) this._postBackoffIdx = 0;
+    const now = this.clock.now();
+    const PLAN = [300000, 120000, 45000, 15000, 6000, 2500];
+    if (!this.releaseAt) {
+      // 不知道放场时刻（目标日期还没放出来）→ 15 秒一次慢慢等
+      return Math.max(Number((this.cfg.schedule || {}).idlePollMs || 15000), 5000);
+    }
+    const left = this.releaseAt - now;
+    if (left > 0) {
+      while (this._probePlanIdx < PLAN.length && PLAN[this._probePlanIdx] > left) this._probePlanIdx++;
+      if (this._probePlanIdx >= PLAN.length) {
+        // 计划点用完 → 安静地等到放场，然后开始退避探针
+        return Math.min(Math.max(left, 200), 60000);
+      }
+      const wait = left - PLAN[this._probePlanIdx];
+      if (wait <= 0) { this._probePlanIdx++; return 0; }
+      return Math.min(wait, 60000);
+    }
+    // ★ 开闸那一刻先立刻探一次（放场瞬间窗口可能已经滚开，省下 1.2 秒），
+    //   之后按 1.2s/1s/2s/4s/8s/12s/15s 退避 —— 一分钟内约 7 次，平台能接受。
+    if (this._postBackoffIdx === 0) { this._postBackoffIdx = 1; return 0; }
+    const BACK = [1200, 1000, 2000, 4000, 8000, 12000, 15000];
+    const idx = Math.min(this._postBackoffIdx - 1, BACK.length - 1);
+    this._postBackoffIdx++;
+    return BACK[idx];
+  }
+
   async _idleWaitForRelease() {
     const sched = this.cfg.schedule || {};
     const idleMs = Math.max(Number(sched.idlePollMs || 15000), 5000);
@@ -1242,8 +1284,11 @@ class Grabber {
             (this._hasBookableTarget() ? '（网格已提前显示候选场地，但那不是可下单状态）' : '')
           );
         }
-        // 闸门关着时窗口大概还没滚，网格几乎每刻都在变 —— 用快节奏复查，
-        // 否则「真正开闸」那一刻可能正好落在 15 秒的盲区里。
+        // ★ 2026-11-11 限流实测：平台对 getNodeAppointInfoList 极敏感 ——
+        //   2 秒一轮时第 5 个请求就开始 HTTP 500「访问过于频繁」，封 30 秒以上。
+        //   所以放场前不再固定间隔连打，只在几个「计划时刻」各探一次（见 _nextProbeWaitMs）。
+        const waitMs = this._nextProbeWaitMs();
+        if (waitMs > 0) { await this._sleepKeepingTokenFresh(waitMs); continue; }
         const fresh = await this._recheckTargetGrid(last);
         // ★ 2026-10-28 实测：这里原来把复查结果丢掉、继续睡 500ms 再拉一次，
         //   于是「服务端 08:00:01.1 滚开窗口」到「08:00:02.0 转入冲刺」白等一个周期。
@@ -1256,11 +1301,7 @@ class Grabber {
             return last;
           }
         }
-        // ★ 2026-11-11 事故：这里原来是 2 秒一轮（≈30 次/分），放场前 15 分钟就打了
-        //   四五百次 —— 平台从那天开始连续三天在 07:45 前后把我们打成 500。
-        //   现在按正常候场节奏（idlePollMs=15s；最后 60 秒才收紧到 500ms）走，
-        //   放场即刻靠 ±releaseRaceMs 的快通道兜住，不再白白烧请求。
-        await sleep(this._releaseRace() ? 250 : this._idleSleepMs(idleMs));
+        // 节奏完全交给 _nextProbeWaitMs：下一轮要么先睡（返回 >0），要么到点再探一次。
         continue;
       }
 
@@ -1387,6 +1428,19 @@ class Grabber {
           if (await this._healAuth()) { await sleep(pollMs); continue; }
           throw this._fatal(e, '冲刺轮询时鉴权失败');
         }
+        // ★ 2026-11-11：平台限流（HTTP 5xx「访问过于频繁」）时不能按 pollMs 硬打 ——
+        //   连着打只会把封禁时间拖长。连续 8 次就收手，交给「放场后跟进」低频复查。
+        if (e instanceof ApiError && Number(e.status) >= 500) {
+          this._burst5xx = (this._burst5xx || 0) + 1;
+          if (this._burst5xx >= 8) {
+            this.log.warn(`连续 ${this._burst5xx} 次服务端 5xx（疑似限流）→ 本轮收手，交给放场后跟进低频复查`);
+            return false;
+          }
+          const backoffMs = Math.min(30000, 1500 * Math.pow(2, this._burst5xx - 1));
+          this.log.warn(`第 ${round} 轮服务端 5xx（${e.message}）→ 退避 ${(backoffMs / 1000).toFixed(1)}s（连续第 ${this._burst5xx} 次）`);
+          await sleep(backoffMs);
+          continue;
+        }
         const es = Date.now() - this.result.at;
         // 网络抖动不致命：记录后继续，但避免无限打
         if (round % 10 === 0) this.log.warn(`第 ${round} 轮异常：${e.message}（已跑 ${(es / 1000).toFixed(0)}s）`);
@@ -1432,6 +1486,7 @@ class Grabber {
         continue;
       }
       emptyStreak = 0;
+      this._burst5xx = 0;
 
       // ★ 日期护栏：目标日期必须落在服务端当前窗口内，否则坚决不下单
       if (!this._windowGuard(g.grid)) {
@@ -1481,6 +1536,12 @@ class Grabber {
           );
           await sleep(100);
           continue;
+        }
+        // ★ 严格模式（--strict）：你选的时段都满了就如实收手，绝不在这里按 500ms
+        //   空转几百轮（2026-11-09 兜底就是被这种节奏打成 500、最后买了 21:00-22:00）。
+        if (this.opts.noFallback) {
+          this.log.info('严格模式：你选的时段当前都没有空位 → 本轮收手（放场后跟进会继续低频复查）');
+          return false;
         }
         await sleep(pollMs);
         continue;
@@ -1892,6 +1953,44 @@ class Grabber {
 
   // ── 编排 ──
 
+  /**
+   * 放场后跟进：主任务没抢到时，按 postWatchMs（默认 20 秒）低频复查网格，
+   * 一旦出现空场地就立刻再冲一次 —— 很多人 8:00 抢到后几秒内又退掉，
+   * 或者干脆没付款，空位会在 08:00-08:10 陆续漏出来。
+   * 这比等 28 分钟后的 08:30 兜底脚本快得多（那时基本没剩的）。
+   *
+   * --post-watch <分钟> 控制跟进时长（默认 0 = 不跟进）。
+   */
+  async _postWatch() {
+    const mins = Math.max(Number((this.opts && this.opts.postWatch) || 0), 0);
+    if (!(mins > 0)) return;
+    if (this.result.orders.length > 0) return;
+    const sched = this.cfg.schedule || {};
+    const stepMs = Math.max(Number(sched.postWatchMs || 20000), 5000);
+    const until = this.clock.now() + mins * 60000;
+    this.log.info(`\n放场后跟进：每 ${(stepMs / 1000).toFixed(0)} 秒复查一次（最多 ${mins} 分钟），有空位就立刻再冲`);
+    while (this.clock.now() < until) {
+      await sleep(Math.min(stepMs, Math.max(until - this.clock.now(), 100)));
+      if (this.result.orders.length > 0) return;
+      let g;
+      try {
+        g = await this.fetchGridRetry(this.targetDate, 1);
+      } catch (e) {
+        this.log.warn(`  放场后跟进：拉网格失败 ${e.message}`);
+        continue;
+      }
+      if (!g.ok) continue;
+      this.grid = g.grid;
+      this._targetGrid = g.grid;
+      const plan = this.buildTargets();
+      if (!plan || !plan.length) continue;
+      this.log.info(`  放场后跟进：出现 ${plan.length} 个候选方案 → 立刻重新冲刺`);
+      try { await this.burst(); } catch (e) { this.log.warn(`  放场后跟进冲刺失败：${e.message}`); }
+      if (this.result.orders.length > 0) return;
+    }
+    this.log.info('  放场后跟进：时间到，本轮结束');
+  }
+
   async run() {
     await this.ensureAuth('启动');
     await this.warmup();
@@ -1909,6 +2008,7 @@ class Grabber {
 
     try {
       await this.burst();
+      await this._postWatch();
       await this.settle();
     } catch (e) {
       this.result.error = this.result.error || e.message;
@@ -1993,6 +2093,8 @@ async function main() {
     dryRun: cli.flags.has('dry-run') || config.safety.dryRun,
     interval: cli.opts.interval,
     maxRounds: cli.opts.maxRounds,
+    // ★ 放场后跟进分钟数（--post-watch）：0 = 不跟进（默认），定时任务传 10。
+    postWatch: Number(cli.opts.postWatch) || 0,
     verbose: cli.flags.has('verbose'),
     // ★ 传下去的是**解析后的窗口**（{from,to,raw}）：grab.js 靠它判断
     //   「这次是不是只许在指定时段里抢」，从而决定要不要兜底到当天任意空档。

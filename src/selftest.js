@@ -814,6 +814,104 @@ async function fiveHundredTests() {
   });
 }
 
+async function probeTests() {
+  section('8h. 限流自适应探针（放场前稀疏计划 + 放场后退避）');
+  const { Grabber } = require('./grab');
+  const log = { file: null, info() {}, warn() {}, error() {}, debug() {}, section() {} };
+  const cfg = { target: {}, net: {}, safety: {}, pay: {}, paths: {}, schedule: { idlePollMs: 15000 } };
+  function mk(leftMs) {
+    const g = new Grabber(cfg, log, {});
+    const t = Date.now();
+    g.releaseAt = leftMs == null ? null : t + leftMs;
+    g.clock = { now: () => t };
+    return g;
+  }
+
+  await ta('放场时刻未知 → 回退到 idlePollMs（15 秒一次）', async () => {
+    assert.strictEqual(mk(null)._nextProbeWaitMs(), 15000);
+  });
+
+  await ta('离放场 6 分钟 → 先睡到「还剩 5 分钟」那个计划点', async () => {
+    assert.strictEqual(mk(360000)._nextProbeWaitMs(), 60000);
+  });
+
+  await ta('离放场 200 秒 → 睡到「还剩 120 秒」（单次睡眠上限 60 秒，醒了再接着算）', async () => {
+    assert.strictEqual(mk(200000)._nextProbeWaitMs(), 60000);
+  });
+
+  await ta('离放场 30 秒 → 睡到「还剩 15 秒」（不再 1 秒一轮）', async () => {
+    assert.strictEqual(mk(30000)._nextProbeWaitMs(), 15000);
+  });
+
+  await ta('离放场 10 秒 → 睡到「还剩 6 秒」', async () => {
+    assert.strictEqual(mk(10000)._nextProbeWaitMs(), 4000);
+  });
+
+  await ta('走到最后一个计划点（还剩 2.5 秒）→ 返回 0 让循环探一次', async () => {
+    const t = Date.now();
+    const g = new Grabber(cfg, log, {});
+    g.releaseAt = t + 3000;
+    let now = t;
+    g.clock = { now: () => now };
+    assert.strictEqual(g._nextProbeWaitMs(), 500, '还差 500ms 到 2.5 秒那一格');
+    now = t + 500;
+    assert.strictEqual(g._nextProbeWaitMs(), 0, '到点就探（不再等）');
+    assert.ok(g._nextProbeWaitMs() > 0, '这一格用完后就安静等到放场');
+  });
+
+  await ta('放场这一刻先探一次，之后 1.2s / 1s / 2s 退避', async () => {
+    const g = mk(-1000);
+    assert.strictEqual(g._nextProbeWaitMs(), 0);
+    assert.strictEqual(g._nextProbeWaitMs(), 1200);
+    assert.strictEqual(g._nextProbeWaitMs(), 1000);
+    assert.strictEqual(g._nextProbeWaitMs(), 2000);
+  });
+
+  await ta('放场后退避封顶 15 秒（不会又变成 500ms 连打）', async () => {
+    const g = mk(-60000);
+    const seen = [];
+    for (let i = 0; i < 10; i++) seen.push(g._nextProbeWaitMs());
+    assert.strictEqual(seen[9], 15000);
+    assert.ok(seen.every((x) => x <= 15000));
+  });
+}
+
+async function strictSettleTests() {
+  section('8i. 严格模式：目标时段全满 → 一轮就收手（不 500ms 空转）');
+  const { Grabber } = require('./grab');
+  const log = { file: null, info() {}, warn() {}, error() {}, debug() {}, section() {} };
+  const cfg = { target: {}, net: {}, safety: {}, pay: {}, paths: {}, schedule: {} };
+  const g = new Grabber(cfg, log, { noFallback: true, maxRounds: 600 });
+  g.targetDate = '2026-11-13';
+  g._targetReady = true;
+  g._gateOpen = () => true;
+  g._gateReason = () => 'stub';
+  g._windowGuard = () => true;
+  g._logGrid = () => {};
+  g.buildTargets = () => [];
+  g._guardDeadline = Date.now() + 600000;
+  let fetches = 0;
+  g.fetchGridRetry = async () => {
+    fetches++;
+    return { ok: true, grid: { courts: [{ id: 'c1', name: '羽毛球场地1' }], grid: {}, slots: [{ value: '16:00-17:00', bookableCount: 0 }] } };
+  };
+
+  await ta('严格模式 + 优先级时段全满 → 只拉 1 次网格就返回 false', async () => {
+    const r = await g.burst();
+    assert.strictEqual(r, false);
+    assert.strictEqual(fetches, 1);
+  });
+
+  await ta('放场后跟进：默认 postWatch=0 时一次网格都不拉', async () => {
+    const g2 = new Grabber(cfg, log, {});
+    let n = 0;
+    g2.fetchGridRetry = async () => { n++; return { ok: true, grid: { courts: [], grid: {}, slots: [] } }; };
+    g2.targetDate = '2026-11-13';
+    await g2._postWatch();
+    assert.strictEqual(n, 0);
+  });
+}
+
 async function burstInsuranceTests() {
   section('8d. 冲刺保险（网格有空位却 0 候选 → 100ms 后重拉网格）');
   const { Grabber } = require('./grab');
@@ -957,14 +1055,13 @@ async function releaseRaceTests() {
     assert.ok(ms < 400, `快通道下不该再睡 500ms（实测 ${ms}ms）`);
   });
 
-  await ta('关掉快通道（releaseRaceMs=0）→ 退回「睡一拍再查」的老节奏', async () => {
+  await ta('关掉快通道（releaseRaceMs=0）→ 放场后也不许 250ms 连打，按 _nextProbeWaitMs 退避', async () => {
     const { g } = mk({ now: now + 1000, releaseAt: now, targetDate: '2026-11-03',
       windowFrom: '2026-10-29', windowTo: '2026-11-03', serverToday: '2026-10-29',
       schedule: { releaseRaceMs: 0, idlePollMs: 15000 } });
-    const t0 = Date.now();
-    await g._idleWaitForRelease();
-    const ms = Date.now() - t0;
-    assert.ok(ms >= 400, `关闭快通道时应保留 500ms 节奏（实测 ${ms}ms）`);
+    // 2026-11-11 起因限流改成「计划探针」：放场瞬间先探一次，随后至少隔 1s
+    assert.strictEqual(g._nextProbeWaitMs(), 0, '放场这一刻先探一次');
+    assert.ok(g._nextProbeWaitMs() >= 1000, '之后必须退避，不能再 250ms 一轮');
   });
 
   t('快通道的边界：放场前 4s 在窗口内，前 6s 已出窗口', () => {
@@ -1334,6 +1431,8 @@ async function online() {
   await burstInsuranceTests();
   strictFallbackTests();
   await fiveHundredTests();
+  await probeTests();
+  await strictSettleTests();
   await releaseRaceTests();
   await orderNoTests();
 
