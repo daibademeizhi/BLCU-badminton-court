@@ -341,6 +341,10 @@ class Grabber {
     let last = null;
     for (let i = 0; i < tries; i++) {
       try {
+        // ★ 记一次请求时间：平台限流按「约 10 秒内最多 4 次」算
+        //   （2026-11-11 实测：2s / 1s / 0.5s 三种间隔都是第 5 次封，解封约 63 秒）。
+        //   冲刺阶段用它自律，宁可慢一点也不要被整段封掉。
+        (this._reqTimes = this._reqTimes || []).push(Date.now());
         const r = await this.fetchGrid(date);
         // 能拉到网格 = 平台对我们这个会话是通的 → 5xx 连击计数清零。
         this._idle5xxStreak = 0;
@@ -1190,6 +1194,21 @@ class Grabber {
    * 这段里候场不再按 idlePollMs/finalPollMs 睡，而是连着一轮一轮快查 ——
    * 服务端什么时候把窗口滚开，我们下一轮就看得到，不必再等满一个复查周期。
    */
+  // ★ 冲刺请求预算（2026-11-11 实测）：平台对 getNodeAppointInfoList 的容忍度是
+  //   「约 10 秒内最多 4 次」，第 5 次直接 500「访问过于频繁，请稍后重试」，封约 63 秒。
+  //   所以冲刺不是越快越好 —— 放场前那几个请求已经用掉额度的话，08:00:00 一到
+  //   就会被封住整分钟，等于把黄金两分钟白送。这里按滑动窗口自律：
+  //   额度用完就睡到窗口过期，再接着冲。
+  _burstBudgetWait() {
+    const sched = this.cfg.schedule || {};
+    const winMs = Math.max(Number(sched.burstWindowMs || 12000), 6000);
+    const batch = Math.max(Number(sched.burstBatch || 4), 1);
+    const now = Date.now();
+    this._reqTimes = (this._reqTimes || []).filter((t) => now - t < winMs);
+    if (this._reqTimes.length < batch) return 0;
+    return Math.max(0, this._reqTimes[0] + winMs - now + 200);
+  }
+
   _releaseRace() {
     const sched = this.cfg.schedule || {};
     const raceMs = Math.max(Number(sched.releaseRaceMs || 0) || 0, 0);
@@ -1654,6 +1673,12 @@ class Grabber {
           `服务端明确拒绝（${this._permanentReject}）→ 本轮不可能再成，结束冲刺（不再空转）`
         );
         return false;
+      }
+      // ★ 请求额度用完就按窗口睡，别把自己打成「访问过于频繁」
+      const budgetWait = this._burstBudgetWait();
+      if (budgetWait > 0) {
+        this.log.info(`本轮已发 ${this._reqTimes.length} 次网格请求，按限流预算歇 ${Math.round(budgetWait / 1000)} 秒再冲`);
+        await sleep(budgetWait);
       }
       await sleep(pollMs);
     }

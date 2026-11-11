@@ -876,6 +876,46 @@ async function probeTests() {
   });
 }
 
+// ── 8j. 冲刺请求预算（2026-11-11 实测：约 10 秒内第 5 次就被限流）──
+async function burstBudgetTests() {
+  section('8j. 冲刺请求预算（10 秒内最多 4 次，第 5 次封约 63 秒）');
+  const { Grabber } = require('./grab');
+  const log = { file: null, info() {}, warn() {}, error() {}, debug() {}, section() {} };
+  const cfg = {
+    target: {}, net: {}, safety: {}, pay: {}, paths: {},
+    schedule: { burstWindowMs: 12000, burstBatch: 4 },
+  };
+  const mk = () => new Grabber(cfg, log, {});
+
+  await ta('没发过请求：不用等', async () => {
+    const g = mk();
+    g._reqTimes = [];
+    assert.strictEqual(g._burstBudgetWait(), 0);
+  });
+
+  await ta('只发了 3 次：还可以接着冲', async () => {
+    const g = mk();
+    const now = Date.now();
+    g._reqTimes = [now - 4000, now - 3000, now - 2000];
+    assert.strictEqual(g._burstBudgetWait(), 0);
+  });
+
+  await ta('已发 4 次：必须等窗口过期（约 8 秒）', async () => {
+    const g = mk();
+    const now = Date.now();
+    g._reqTimes = [now - 4000, now - 3000, now - 2000, now - 1000];
+    const w = g._burstBudgetWait();
+    assert.ok(w > 7000 && w <= 8400, '实际 ' + w);
+  });
+
+  await ta('旧请求已出窗口：额度恢复', async () => {
+    const g = mk();
+    const now = Date.now();
+    g._reqTimes = [now - 20000, now - 19000, now - 18000, now - 17000];
+    assert.strictEqual(g._burstBudgetWait(), 0);
+  });
+}
+
 async function strictSettleTests() {
   section('8i. 严格模式：目标时段全满 → 一轮就收手（不 500ms 空转）');
   const { Grabber } = require('./grab');
@@ -1432,6 +1472,7 @@ async function online() {
   strictFallbackTests();
   await fiveHundredTests();
   await probeTests();
+  await burstBudgetTests();
   await strictSettleTests();
   await releaseRaceTests();
   await orderNoTests();
