@@ -26,7 +26,13 @@ const { ApiClient } = require('./client');
 const { ensureToken } = require('./login');
 const { fmtServer } = require('./util');
 
-const STATUS_TEXT = { '1': '未使用', '2': '已退款', '8': '已使用', '12': '排队中' };
+const STATUS_TEXT = {
+  '1': '未使用',
+  '2': '已退款',
+  '8': '已使用',
+  '9': '待支付',   // 2026-11-12 实测：锁场成功但支付失败，订单停在这一档
+  '12': '排队中',
+};
 
 function statusText(s) {
   return STATUS_TEXT[String(s)] || `状态${s}`;

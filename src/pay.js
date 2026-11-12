@@ -1,4 +1,4 @@
-﻿'use strict';
+'use strict';
 /**
  * 支付模块 —— 自动/半自动把抢到的场地付掉
  *
@@ -51,13 +51,13 @@ const PAYWAY_NO_PAY = ['27', '100'];
  * 能「纯服务端」完成的支付通道，按优先级排列。
  *
  * ══════════════════════════════════════════════════════════════════════════
- * 2026-10-10 实测（该账号）getPaywayList 只返回两项：
- *   payway=50  统一支付平台（<你的学校>统一支付平台支付, opencard=1, txcode=yy050）
+ * 2026-10-10 实测（本账号）getPaywayList 只返回两项：
+ *   payway=50  统一支付平台（北京语言大学统一支付平台支付, opencard=1, txcode=yy050）
  *              → POST /mobile/pay/bjyyPayOrder，成功只返回 payurl，前端 location.href 跳转
  *              → 必然要在浏览器/微信里完成，**服务端跑不完**
  *   payway=77  一卡通支付
  *              → POST /mobile/pay/openPlatFormPayOrder，服务端直接扣款，**无需密码、无需跳转**
- *   payway=78  账户卡余额 —— 该账号**未开通**（学校没给这个通道）
+ *   payway=78  账户卡余额 —— 本账号**未开通**（学校没给这个通道）
  *              → POST /mobile/pay/accountPayOrder，同样全服务端
  *
  * 另：学校 getInfoByType(type="other") 里 checkYktPwd=true，
@@ -294,7 +294,7 @@ class AutoPay {
       if (ok) {
         this.log.info(`★ 支付成功：订单 ${orderno}  金额 ${amount}  通道 ${payway}（${ch.name}）`);
         await this.notify(
-          `【本校 抢场】已自动支付成功 ✅\n订单号：${orderno}\n金额：${amount} 元\n通道：${payway} ${ch.name}`
+          `【BLCU 抢场】已自动支付成功 ✅\n订单号：${orderno}\n金额：${amount} 元\n通道：${payway} ${ch.name}`
         );
         return { paid: true, mode, message: '支付成功', accno: this.accno, payway, diag };
       }
@@ -348,7 +348,7 @@ class AutoPay {
     // 1b) 服务端通道列表拿不到时的兜底：config 里显式指定的通道照用不误。
     //     意义在于——2026-10-10 实测 getPaywayList 会整段 500（连空 body 都 500），
     //     而当天抢场依旧发生；若没有这条兜底，抢到场地后会白白降级成人工付款。
-    //     该账号实测只有 77 能服务端闭环，所以配置里预置 77 最稳（这条通道不依赖
+    //     本账号实测只有 77 能服务端闭环，所以配置里预置 77 最稳（这条通道不依赖
     //     banknum、不需要密码，跳过 getPaywayList 的唯一损失是无法感知学校新开的通道）。
     if (!items.length) {
       const forced = String(this.cfg.pay.payway || '').trim();
@@ -504,7 +504,7 @@ class AutoPay {
   async _askManual(locked, reason) {
     const c = locked || {};
     const text = [
-      '【本校 抢场】场地已锁定，请尽快付款',
+      '【BLCU 抢场】场地已锁定，请尽快付款',
       `日期：${c.date || ''}`,
       `时段：${(c.slots || []).join(' + ')}`,
       `场地：${c.courtName || c.court || ''}`,
@@ -519,6 +519,63 @@ class AutoPay {
     } catch (e) {
       this.log.warn(`推送失败：${e.message}`);
     }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  补支付 CLI：对「已经锁到但没付成」的订单再付一次
+//    node src/pay.js --orderno 134799 --amount 80.00
+//    node src/pay.js --orderno 134799 --amount 80.00 --dry   # 只看会发什么，不真扣
+//  2026-11-12 事故（订单 134799）就是锁场成功、自动支付两次都「支付请求失败」，
+//  当时没有这个入口，只能人工去微信里找。有它就能「充值后补付」。
+// ─────────────────────────────────────────────────────────────────────────────
+if (require.main === module) {
+  const argv = process.argv.slice(2);
+  const arg = (name) => {
+    const i = argv.indexOf(name);
+    return i >= 0 ? String(argv[i + 1] || '') : '';
+  };
+  const orderno = arg('--orderno');
+  const amount = Number(arg('--amount') || 0);
+  const dry = argv.includes('--dry');
+  if (!orderno) {
+    console.error('用法：node src/pay.js --orderno <订单号> --amount <金额，如 80.00> [--dry]');
+    process.exitCode = 2;
+  } else {
+    const { loadConfig } = require('./config');
+    const { ApiClient } = require('./client');
+    const { ensureToken } = require('./login');
+    const log = {
+      file: null,
+      section: (m) => console.log(`\n── ${m} ──`),
+      info: (m) => console.log(`[info] ${m}`),
+      warn: (m) => console.log(`[warn] ${m}`),
+      error: (m) => console.log(`[error] ${m}`),
+      debug: () => {},
+    };
+    (async () => {
+      const { config } = loadConfig();
+      const auth = await ensureToken(config, { log: () => {} });
+      const client = new ApiClient({
+        baseUrl: config.baseUrl,
+        prefix: config.prefix,
+        token: auth.token,
+        timeout: config.net.timeoutMs,
+        minInterval: config.net.minIntervalMs,
+        verbose: false,
+      });
+      const pay = new AutoPay({ cfg: config, log, client });
+      if (dry) {
+        config.pay.dryRunPay = true;
+      }
+      const r = await pay.settle({ orderno, price: amount, slots: [], court: '' }, {});
+      console.log('');
+      console.log(`结果：paid=${r.paid}  ${r.message || ''}`);
+      process.exitCode = r.paid ? 0 : 1;
+    })().catch((e) => {
+      console.error(`★ 补支付失败：${(e && e.message) || e}`);
+      process.exitCode = 1;
+    });
   }
 }
 
